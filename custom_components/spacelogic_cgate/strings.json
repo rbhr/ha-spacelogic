@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to C-Gate Server",
+        "description": "Enter the connection details for your Clipsal/SpaceLogic C-Gate server.",
+        "data": {
+          "host": "Host",
+          "command_port": "Command port",
+          "event_port": "Event port",
+          "status_change_port": "Status change port",
+          "project_name": "Project name"
+        },
+        "data_description": {
+          "host": "Hostname or IP address of the C-Gate server",
+          "project_name": "The C-Gate project name (as configured in Toolkit)"
+        }
+      },
+      "group_types": {
+        "title": "Configure group types",
+        "description": "Select the entity type for each discovered C-Bus group. Groups default to dimmable light."
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to C-Gate server",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This C-Gate server is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure group types",
+        "description": "Select the entity type for each C-Bus group. Groups default to dimmable light."
+      }
+    }
+  }
+}
