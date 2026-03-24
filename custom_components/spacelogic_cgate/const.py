@@ -9,10 +9,10 @@ DEFAULT_STATUS_CHANGE_PORT = 20025
 DEFAULT_CONFIG_CHANGE_PORT = 20026
 
 # C-Gate default host
-DEFAULT_HOST = "192.168.11.24"
+DEFAULT_HOST = "localhost"
 
 # C-Gate default project
-DEFAULT_PROJECT_NAME = "YELMAH"
+DEFAULT_PROJECT_NAME = "HOME"
 
 # C-Gate connection
 CONF_COMMAND_PORT = "command_port"
