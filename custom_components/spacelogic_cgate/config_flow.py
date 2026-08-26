@@ -13,6 +13,7 @@ from homeassistant.config_entries import (
     OptionsFlowWithConfigEntry,
 )
 from homeassistant.const import CONF_HOST
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import selector
 
 from .cgate import CGateClient, CGateConnectionError, CGateGroup
@@ -62,6 +63,11 @@ ENTITY_TYPE_OPTIONS = [
     selector.SelectOptionDict(value=GROUP_TYPE_SWITCH, label="Switch"),
     selector.SelectOptionDict(value=GROUP_TYPE_VALVE, label="Valve"),
 ]
+
+
+def _entry_title(host: str, command_port: int) -> str:
+    """Return the auto-generated entry title for a C-Gate connection."""
+    return f"C-Gate ({host}:{command_port})"
 
 
 def _group_display_key(group: CGateGroup) -> str:
@@ -213,6 +219,88 @@ class CGateConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    def _abort_if_other_entry_matches(
+        self, entry: ConfigEntry, user_input: dict[str, Any]
+    ) -> None:
+        """Abort if a *different* entry already points at this C-Gate project.
+
+        `_async_abort_entries_match` would match the entry being reconfigured
+        against itself, so the current entry is skipped explicitly.
+        """
+        for other in self._async_current_entries(include_ignore=False):
+            if other.entry_id == entry.entry_id:
+                continue
+            if all(
+                other.data.get(key) == user_input[key]
+                for key in (CONF_HOST, CONF_COMMAND_PORT, CONF_PROJECT_NAME)
+            ):
+                raise AbortFlow("already_configured")
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Change the connection details of an existing entry.
+
+        The entry is updated in place, so entity IDs, unique IDs and device
+        registry entries all survive: they are keyed on the config entry ID
+        and the C-Bus address, never on the host, port or project name.
+        Group type overrides in `entry.options` are likewise left alone.
+        """
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self._abort_if_other_entry_matches(entry, user_input)
+
+            client = CGateClient(
+                host=user_input[CONF_HOST],
+                command_port=user_input[CONF_COMMAND_PORT],
+                event_port=user_input[CONF_EVENT_PORT],
+                status_change_port=user_input[CONF_STATUS_CHANGE_PORT],
+                project_name=user_input[CONF_PROJECT_NAME],
+            )
+
+            try:
+                await client.connect()
+            except CGateConnectionError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception during connection test")
+                errors["base"] = "unknown"
+            else:
+                await client.disconnect()
+                return self._apply_reconfigure(entry, user_input)
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_USER_DATA_SCHEMA, {**entry.data, **(user_input or {})}
+            ),
+            errors=errors,
+        )
+
+    def _apply_reconfigure(
+        self, entry: ConfigEntry, user_input: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Write new connection details to the entry and finish the flow."""
+        updates: dict[str, Any] = {"data": {**entry.data, **user_input}}
+
+        # Refresh the title only while it is still the auto-generated one, so a
+        # manually renamed entry keeps the name the user gave it.
+        auto_title = _entry_title(
+            entry.data[CONF_HOST],
+            entry.data.get(CONF_COMMAND_PORT, DEFAULT_COMMAND_PORT),
+        )
+        if entry.title == auto_title:
+            updates["title"] = _entry_title(
+                user_input[CONF_HOST], user_input[CONF_COMMAND_PORT]
+            )
+
+        # The update listener registered in async_setup_entry reloads the entry
+        # when this actually changes something, so no reload is scheduled here.
+        self.hass.config_entries.async_update_entry(entry, **updates)
+        return self.async_abort(reason="reconfigure_successful")
+
     async def async_step_group_types(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -220,9 +308,9 @@ class CGateConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             overrides = _parse_group_type_input(user_input, self._key_to_uid)
             return self.async_create_entry(
-                title=(
-                    f"C-Gate ({self._user_input[CONF_HOST]}"
-                    f":{self._user_input[CONF_COMMAND_PORT]})"
+                title=_entry_title(
+                    self._user_input[CONF_HOST],
+                    self._user_input[CONF_COMMAND_PORT],
                 ),
                 data=self._user_input,
                 options={CONF_GROUP_OVERRIDES: overrides} if overrides else {},

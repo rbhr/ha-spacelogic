@@ -36,6 +36,7 @@ Groups are auto-discovered from the C-Gate project database. Each group can be m
   - And many more (30+ unit types from the C-Bus specification)
 - **Area auto-matching** — groups are suggested to Home Assistant areas by matching C-Bus tag names
 - **Per-group type overrides** — reassign any group to a different entity type via the Options flow
+- **Reconfigurable connection** — change the C-Gate host, ports or project without losing entity IDs or history
 - **Virtual group detection** — groups without physical units are automatically detected and excluded from polling
 - **Keepalive & auto-reconnect** — maintains persistent TCP connections with automatic recovery
 
@@ -73,6 +74,20 @@ Groups are auto-discovered from the C-Gate project database. Each group can be m
 4. The integration will connect, discover all groups, and present a type-assignment screen
 5. For each discovered group, select the appropriate entity type (dimmer, relay, switch, cover, fan, lock, or valve)
 6. Click **Submit** to finish setup
+
+### Changing the C-Gate Server Address
+
+If your C-Gate server moves to a new IP address (or you change a port or the
+project name):
+
+1. Go to **Settings > Devices & Services**
+2. Find the SpaceLogic C-Gate integration, open its menu (**⋮**) and click **Reconfigure**
+3. Update the connection details and submit
+
+The new details are tested before they are saved, and the existing config entry
+is updated in place — every entity keeps its entity ID, its history and its
+group type assignment, and devices stay where they are. Deleting and re-adding
+the integration would *not* preserve these, so use Reconfigure instead.
 
 ### Reconfiguring Group Types
 

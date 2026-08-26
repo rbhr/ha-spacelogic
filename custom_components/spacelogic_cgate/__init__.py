@@ -52,15 +52,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: CGateConfigEntry) -> boo
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     entry.async_on_unload(client.disconnect)
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
 
     return True
 
 
-async def _async_options_updated(
+async def _async_entry_updated(
     hass: HomeAssistant, entry: CGateConfigEntry
 ) -> None:
-    """Reload the integration when options change."""
+    """Reload the integration when options or connection details change.
+
+    HA only fires this when the entry actually changed, which makes it the
+    single reload path for both the options flow and the reconfigure flow.
+    """
     await hass.config_entries.async_reload(entry.entry_id)
 
 

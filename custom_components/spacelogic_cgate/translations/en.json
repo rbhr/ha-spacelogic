@@ -19,6 +19,21 @@
       "group_types": {
         "title": "Configure group types",
         "description": "Select the entity type for each discovered C-Bus group. Groups default to dimmable light."
+      },
+      "reconfigure": {
+        "title": "Change C-Gate connection",
+        "description": "Update the connection details for your C-Gate server, for example after its IP address changed. Your entities, their IDs and your group type settings are all kept.",
+        "data": {
+          "host": "Host",
+          "command_port": "Command port",
+          "event_port": "Event port",
+          "status_change_port": "Status change port",
+          "project_name": "Project name"
+        },
+        "data_description": {
+          "host": "Hostname or IP address of the C-Gate server",
+          "project_name": "The C-Gate project name (as configured in Toolkit)"
+        }
       }
     },
     "error": {
@@ -26,7 +41,8 @@
       "unknown": "Unexpected error"
     },
     "abort": {
-      "already_configured": "This C-Gate server is already configured"
+      "already_configured": "This C-Gate server is already configured",
+      "reconfigure_successful": "C-Gate connection details updated"
     }
   },
   "options": {
