@@ -10,7 +10,19 @@ from custom_components.spacelogic_cgate.light import CGateLight
 
 
 def _setattr(obj: object, name: str, value: object) -> None:
-    """Set attribute bypassing MagicMock __setattr__."""
+    """Set attribute bypassing MagicMock __setattr__.
+
+    HA exposes ``_attr_*`` names as cached-property data descriptors, which take
+    precedence over the instance ``__dict__``; those must go through the
+    descriptor or the write is silently ignored on read-back.
+    """
+    for klass in type(obj).__mro__:
+        descriptor = klass.__dict__.get(name)
+        if descriptor is not None:
+            if hasattr(descriptor, "__set__"):
+                descriptor.__set__(obj, value)
+                return
+            break
     object.__getattribute__(obj, "__dict__")[name] = value
 
 

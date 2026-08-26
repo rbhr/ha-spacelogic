@@ -10,16 +10,28 @@ from custom_components.spacelogic_cgate.cgate import (
     CGateGroup,
     CGateMeasurement,
 )
-from custom_components.spacelogic_cgate.switch import CGateSwitch
 from custom_components.spacelogic_cgate.cover import CGateCover
-from custom_components.spacelogic_cgate.lock import CGateLock
 from custom_components.spacelogic_cgate.fan import CGateFan
-from custom_components.spacelogic_cgate.valve import CGateValve
+from custom_components.spacelogic_cgate.lock import CGateLock
 from custom_components.spacelogic_cgate.sensor import CGateMeasurementSensor
+from custom_components.spacelogic_cgate.switch import CGateSwitch
+from custom_components.spacelogic_cgate.valve import CGateValve
 
 
 def _setattr(obj: object, name: str, value: object) -> None:
-    """Set attribute bypassing MagicMock __setattr__."""
+    """Set attribute bypassing MagicMock __setattr__.
+
+    HA exposes ``_attr_*`` names as cached-property data descriptors, which take
+    precedence over the instance ``__dict__``; those must go through the
+    descriptor or the write is silently ignored on read-back.
+    """
+    for klass in type(obj).__mro__:
+        descriptor = klass.__dict__.get(name)
+        if descriptor is not None:
+            if hasattr(descriptor, "__set__"):
+                descriptor.__set__(obj, value)
+                return
+            break
     object.__getattribute__(obj, "__dict__")[name] = value
 
 

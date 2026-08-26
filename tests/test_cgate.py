@@ -2,23 +2,23 @@
 
 from __future__ import annotations
 
-import pytest
-
 import asyncio
 from unittest.mock import AsyncMock
 
+import pytest
+
 from custom_components.spacelogic_cgate.cgate import (
-    CGateCommandError,
-    CGateGroup,
-    CGateClient,
-    CGateMeasurement,
-    SCP_LIGHTING_PATTERN,
-    SCP_MEASUREMENT_PATTERN,
     LEVEL_RESPONSE_PATTERN,
     RESPONSE_PATTERN,
     RESPONSE_XML_BEGIN,
     RESPONSE_XML_CONTENT,
     RESPONSE_XML_END,
+    SCP_LIGHTING_PATTERN,
+    SCP_MEASUREMENT_PATTERN,
+    CGateClient,
+    CGateCommandError,
+    CGateGroup,
+    CGateMeasurement,
     parse_xml_groups,
 )
 

@@ -6,7 +6,6 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -90,7 +89,9 @@ def _build_group_type_schema(
 
     fields: dict[vol.Required, selector.SelectSelector] = {}
     key_to_uid: dict[str, str] = {}
-    for uid, group in sorted(groups.items(), key=lambda item: _group_display_key(item[1]).casefold()):
+    for uid, group in sorted(
+        groups.items(), key=lambda item: _group_display_key(item[1]).casefold()
+    ):
         display_key = _group_display_key(group)
         key_to_uid[display_key] = uid
         current_type = current_overrides.get(uid, DEFAULT_GROUP_TYPE)

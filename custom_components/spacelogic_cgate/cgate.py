@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -291,16 +292,15 @@ class CGateClient:
         """Connect to the C-Gate server."""
         try:
             # Connect command port (large buffer for DBGETXML responses)
-            self._cmd_reader, self._cmd_writer = await asyncio.wait_for(
+            cmd_reader, cmd_writer = await asyncio.wait_for(
                 asyncio.open_connection(
                     self.host, self.command_port, limit=CMD_BUFFER_LIMIT
                 ),
                 timeout=10,
             )
+            self._cmd_reader, self._cmd_writer = cmd_reader, cmd_writer
             # Wait for 201 Service Ready
-            greeting = await asyncio.wait_for(
-                self._cmd_reader.readline(), timeout=10
-            )
+            greeting = await asyncio.wait_for(cmd_reader.readline(), timeout=10)
             greeting_text = greeting.decode("ascii", errors="replace").strip()
             if not greeting_text.startswith(str(RESPONSE_SERVICE_READY)):
                 raise CGateConnectionError(
@@ -336,7 +336,7 @@ class CGateClient:
             self._event_task = asyncio.create_task(self._event_listener())
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
-        except (OSError, asyncio.TimeoutError) as err:
+        except (TimeoutError, OSError) as err:
             await self.disconnect()
             raise CGateConnectionError(
                 f"Failed to connect to C-Gate at {self.host}:{self.command_port}"
@@ -349,10 +349,8 @@ class CGateClient:
         for task in (self._keepalive_task, self._scp_task, self._event_task):
             if task is not None:
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
         self._keepalive_task = None
         self._scp_task = None
         self._event_task = None
@@ -360,10 +358,8 @@ class CGateClient:
         for writer in (self._cmd_writer, self._scp_writer, self._event_writer):
             if writer is not None:
                 writer.close()
-                try:
+                with contextlib.suppress(OSError):
                     await writer.wait_closed()
-                except OSError:
-                    pass
         self._cmd_writer = None
         self._scp_writer = None
         self._event_writer = None
@@ -570,7 +566,7 @@ class CGateClient:
                     await self._send_command("NOOP")
             except CGateCommandError:
                 _LOGGER.warning("Keepalive NOOP failed")
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 _LOGGER.error("C-Gate keepalive connection lost")
                 self._connected = False
                 break
@@ -597,7 +593,7 @@ class CGateClient:
 
             except asyncio.CancelledError:
                 return
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 _LOGGER.error("C-Gate SCP connection lost")
                 break
 
@@ -618,7 +614,7 @@ class CGateClient:
                 _LOGGER.debug("C-Gate EVT: %s", text)
             except asyncio.CancelledError:
                 return
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 _LOGGER.error("C-Gate event connection lost")
                 break
 

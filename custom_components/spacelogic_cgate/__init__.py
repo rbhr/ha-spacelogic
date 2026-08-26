@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, Platform
 from homeassistant.core import HomeAssistant
 
+from .cgate import CGateClient
 from .const import (
     CONF_COMMAND_PORT,
     CONF_EVENT_PORT,
@@ -16,9 +17,7 @@ from .const import (
     DEFAULT_COMMAND_PORT,
     DEFAULT_EVENT_PORT,
     DEFAULT_STATUS_CHANGE_PORT,
-    DOMAIN,
 )
-from .cgate import CGateClient
 
 _LOGGER = logging.getLogger(__name__)
 
