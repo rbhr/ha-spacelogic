@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from datetime import datetime, timedelta
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -18,17 +20,22 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 
 from . import CGateConfigEntry
-from .cgate import CGateClient, CGateMeasurement
+from .cgate import CGateClient, CGateConnectionError, CGateMeasurement
 from .const import (
+    DEFAULT_MEASUREMENT_SCAN_INTERVAL,
+    DEFAULT_MEASUREMENT_STALE_AFTER,
     DOMAIN,
     UNIT_CODE_AMPS,
     UNIT_CODE_CELSIUS,
     UNIT_CODE_HERTZ,
     UNIT_CODE_LUX,
+    UNIT_CODE_OHMS,
     UNIT_CODE_PASCAL,
     UNIT_CODE_PERCENT,
     UNIT_CODE_VOLTS,
@@ -50,6 +57,14 @@ _MeasMeta = tuple[
 # Only codes with a natural HA device_class mapping are listed;
 # unknown codes get a generic sensor with the raw value.
 _UNIT_CODE_META: dict[int, _MeasMeta] = {
+    # HA 2026.8.3 has no SensorDeviceClass.RESISTANCE, so device_class stays
+    # None. Without this entry these channels render as "CH2 Unit 24".
+    UNIT_CODE_OHMS: (
+        "Resistance",
+        None,
+        "Ω",
+        SensorStateClass.MEASUREMENT,
+    ),
     UNIT_CODE_CELSIUS: (
         "Temperature",
         SensorDeviceClass.TEMPERATURE,
@@ -137,6 +152,63 @@ async def async_setup_entry(
     unsub = client.register_measurement_callback(_handle_measurement)
     entry.async_on_unload(unsub)
 
+    # One shared poll task, not per-entity async_update. Every command already
+    # serialises behind the client's single _cmd_lock, and ~150 group polls
+    # already run on HA's 30s cycle; 14 concurrent measurement pollers would
+    # queue ahead of user-initiated commands such as a light switch press.
+    channels = _known_channels(hass, entry)
+
+    async def _poll(_now: datetime | None = None) -> None:
+        if not client.connected or not channels:
+            return
+        # The supervisor is already rebuilding the link; nothing to do here.
+        with contextlib.suppress(CGateConnectionError):
+            await client.async_refresh_measurements(channels)
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass, _poll, timedelta(seconds=DEFAULT_MEASUREMENT_SCAN_INTERVAL)
+        )
+    )
+
+    @callback
+    def _on_connection(connected: bool) -> None:
+        """Refresh immediately on reconnect rather than waiting a full cycle."""
+        if connected:
+            entry.async_create_background_task(
+                hass, _poll(), "cgate_measurement_refresh"
+            )
+
+    entry.async_on_unload(client.register_connection_callback(_on_connection))
+
+
+def _known_channels(
+    hass: HomeAssistant, entry: CGateConfigEntry
+) -> list[tuple[int, int, int]]:
+    """Rebuild the channel list from the entity registry.
+
+    The registry already persists exactly which channels exist, so this needs no
+    extra storage and no probe on a normal start. Note the integration's own
+    DBGETXML-based discovery cannot help here: it walks a four-level tree, while
+    a measurement channel is five levels deep.
+    """
+    channels: list[tuple[int, int, int]] = []
+    prefix = f"{entry.entry_id}_meas_"
+    for reg_entry in er.async_entries_for_config_entry(
+        er.async_get(hass), entry.entry_id
+    ):
+        if not reg_entry.unique_id.startswith(prefix):
+            continue
+        parts = reg_entry.unique_id[len(prefix):].split("_")
+        if len(parts) != 4:
+            continue
+        try:
+            network, _app, device, channel = (int(p) for p in parts)
+        except ValueError:
+            continue
+        channels.append((network, device, channel))
+    return channels
+
 
 class CGateMeasurementSensor(SensorEntity):
     """Representation of a C-Bus measurement channel as a sensor."""
@@ -194,8 +266,17 @@ class CGateMeasurementSensor(SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Return True if the C-Gate connection is active."""
-        return self._client.connected
+        """Return True if connected and the channel has reported recently.
+
+        Staleness matters because a frozen reading is worse than a missing one:
+        nothing downstream can tell it is dead. Caveat: a poll returns C-Gate's
+        cached value, so this catches C-Gate down / channel gone / poll loop
+        dead, but not a failed physical sensor behind a live C-Gate.
+        """
+        return (
+            self._client.connected
+            and self._measurement.age < DEFAULT_MEASUREMENT_STALE_AFTER
+        )
 
     @callback
     def _handle_measurement_update(self, meas: CGateMeasurement) -> None:
@@ -203,10 +284,20 @@ class CGateMeasurementSensor(SensorEntity):
         if meas.unique_id == self._measurement.unique_id:
             self.async_write_ha_state()
 
+    @callback
+    def _handle_connection_change(self, connected: bool) -> None:
+        """Reflect connect/disconnect immediately rather than at the next poll."""
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         """Register for measurement updates when entity is added."""
         self.async_on_remove(
             self._client.register_measurement_callback(
                 self._handle_measurement_update
+            )
+        )
+        self.async_on_remove(
+            self._client.register_connection_callback(
+                self._handle_connection_change
             )
         )

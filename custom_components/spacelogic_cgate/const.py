@@ -27,7 +27,15 @@ RESPONSE_OBJECT_INFO = 300
 
 # C-Gate keepalive
 DEFAULT_KEEPALIVE_INTERVAL = 60  # seconds
-RECONNECT_DELAY = 15  # seconds
+RECONNECT_DELAY = 15  # seconds — first retry delay, then doubles
+RECONNECT_DELAY_MAX = 120  # seconds — backoff ceiling
+
+# Measurement application (228) polling
+DEFAULT_MEASUREMENT_SCAN_INTERVAL = 30  # seconds between measurement polls
+DEFAULT_MEASUREMENT_STALE_AFTER = 300  # seconds before a channel reads unavailable
+MEASUREMENT_SCAN_MAX_DEVICE = 15
+MEASUREMENT_SCAN_MAX_CHANNEL = 7
+DEFAULT_MEASUREMENT_NETWORK = 254
 
 # C-Bus applications
 CBUS_LIGHTING_APPLICATION = 56  # 0x38

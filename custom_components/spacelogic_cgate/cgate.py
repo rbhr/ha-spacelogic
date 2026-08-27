@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import logging
 import re
+import socket
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -14,6 +16,11 @@ from .const import (
     CBUS_LIGHTING_APPLICATION,
     CBUS_MEASUREMENT_APPLICATION,
     DEFAULT_KEEPALIVE_INTERVAL,
+    DEFAULT_MEASUREMENT_NETWORK,
+    MEASUREMENT_SCAN_MAX_CHANNEL,
+    MEASUREMENT_SCAN_MAX_DEVICE,
+    RECONNECT_DELAY,
+    RECONNECT_DELAY_MAX,
     RESPONSE_SERVICE_READY,
 )
 
@@ -42,6 +49,16 @@ SCP_MEASUREMENT_PATTERN = re.compile(
     r"^measurement\s+data\s+//(\S+?)/(\d+)/(\d+)/(\d+)/(\d+)"
     r"\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)"
     r"(?:\s+#sourceunit=(\d+))?"
+)
+
+# Pattern to parse a polled measurement response on the COMMAND port:
+#   300 //PROJECT/NET/228/DEVICE/CHANNEL: Data=VALUE,EXPONENT,UNITS,SEQ
+# Structurally different from SCP_MEASUREMENT_PATTERN above (commas after
+# "Data=" rather than spaces, and no #sourceunit), so it needs its own regex.
+# The 4th field's meaning is unverified; it is captured but nothing depends on it.
+MEASUREMENT_DATA_RESPONSE_PATTERN = re.compile(
+    r"^300\s+//(\S+?)/(\d+)/(\d+)/(\d+)/(\d+):\s*Data="
+    r"(-?\d+),(-?\d+),(-?\d+)(?:,(-?\d+))?"
 )
 
 # C-Gate DBGETXML response codes
@@ -105,11 +122,26 @@ class CGateMeasurement:
     exponent: int = 0
     units: int = 0  # C-Bus unit code from event (see const.py UNIT_CODE_*)
     source_unit: int = 0
+    last_seen: float = 0.0  # time.monotonic() of the last successful reading
 
     @property
     def value(self) -> float:
-        """Return the computed measurement value (raw_value × 10^exponent)."""
-        return self.raw_value * (10 ** self.exponent)
+        """Return the computed measurement value (raw_value × 10^exponent).
+
+        Rounded by the exponent rather than left as a raw float product: the
+        exponent *is* the precision, so this is exact by construction and kills
+        artefacts like 23.400000000000002.
+        """
+        if self.exponent >= 0:
+            return float(self.raw_value * 10 ** self.exponent)
+        return round(self.raw_value / 10 ** -self.exponent, -self.exponent)
+
+    @property
+    def age(self) -> float:
+        """Seconds since the last successful reading, or inf if never seen."""
+        if not self.last_seen:
+            return float("inf")
+        return time.monotonic() - self.last_seen
 
     @property
     def unique_id(self) -> str:
@@ -250,6 +282,14 @@ class CGateClient:
     _measurement_callbacks: list[Callable[[CGateMeasurement], None]] = field(
         default_factory=list, repr=False
     )
+    _connection_callbacks: list[Callable[[bool], None]] = field(
+        default_factory=list, repr=False
+    )
+    _supervisor_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _reconnect_event: asyncio.Event = field(
+        default_factory=asyncio.Event, repr=False
+    )
+    _closing: bool = field(default=False, repr=False)
 
     @property
     def connected(self) -> bool:
@@ -277,6 +317,41 @@ class CGateClient:
 
         return unsubscribe
 
+    def register_connection_callback(
+        self, callback: Callable[[bool], None]
+    ) -> Callable[[], None]:
+        """Register a callback for connect/disconnect. Returns unsubscribe function."""
+        self._connection_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            self._connection_callbacks.remove(callback)
+
+        return unsubscribe
+
+    def _notify_connection(self, connected: bool) -> None:
+        """Tell subscribers the connection state changed."""
+        for callback in self._connection_callbacks:
+            try:
+                callback(connected)
+            except Exception:  # noqa: BLE001 - a bad subscriber must not stop the rest
+                _LOGGER.exception("Error in connection callback")
+
+    def _mark_disconnected(self, reason: str) -> None:
+        """Record that the link is dead and wake the supervisor.
+
+        Every place that notices a dead socket funnels through here. Previously
+        each one simply broke out of its loop, and _scp_listener did not even
+        clear _connected -- so a C-Gate restart left every entity 'available'
+        with a permanently frozen value.
+        """
+        if self._closing:
+            return
+        if self._connected:
+            _LOGGER.warning("C-Gate connection lost: %s", reason)
+            self._connected = False
+            self._notify_connection(False)
+        self._reconnect_event.set()
+
     def register_status_callback(
         self, callback: Callable[[CGateGroup], None]
     ) -> Callable[[], None]:
@@ -289,7 +364,14 @@ class CGateClient:
         return unsubscribe
 
     async def connect(self) -> None:
-        """Connect to the C-Gate server."""
+        """Connect, then keep the connection alive for the life of the entry."""
+        self._closing = False
+        await self._connect_once()
+        if self._supervisor_task is None:
+            self._supervisor_task = asyncio.create_task(self._supervisor())
+
+    async def _connect_once(self) -> None:
+        """Open all three sockets and start the listeners. Raises on failure."""
         try:
             # Connect command port (large buffer for DBGETXML responses)
             cmd_reader, cmd_writer = await asyncio.wait_for(
@@ -323,6 +405,7 @@ class CGateClient:
             _LOGGER.debug("C-Gate event port connected")
 
             self._connected = True
+            self._apply_tcp_keepalive()
 
             # Set up project
             await self._send_command(f"PROJECT USE {self.project_name}")
@@ -336,14 +419,99 @@ class CGateClient:
             self._event_task = asyncio.create_task(self._event_listener())
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
-        except (TimeoutError, OSError) as err:
-            await self.disconnect()
+            self._reconnect_event.clear()
+            self._notify_connection(True)
+
+        except (TimeoutError, OSError, CGateCommandError) as err:
+            # CGateCommandError matters here: PROJECT USE / PROJECT START run
+            # after all three sockets are open, and C-Gate answers 401 when the
+            # project is missing. Without it in this tuple the exception escapes
+            # past disconnect() and leaks all three sockets on every attempt.
+            await self._close_sockets_and_listeners()
             raise CGateConnectionError(
                 f"Failed to connect to C-Gate at {self.host}:{self.command_port}"
             ) from err
 
+    def _apply_tcp_keepalive(self) -> None:
+        """Enable TCP keepalive so a silently dead socket is noticed.
+
+        The SCP and event ports carry no guaranteed traffic -- at 3am a quiet
+        house is indistinguishable from a dead socket -- so the OS has to be the
+        one to notice. Linux-only options are probed rather than assumed.
+        """
+        for writer in (self._cmd_writer, self._scp_writer, self._event_writer):
+            if writer is None:
+                continue
+            sock = writer.get_extra_info("socket")
+            if sock is None:
+                continue
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                for opt, value in (
+                    ("TCP_KEEPIDLE", 60),
+                    ("TCP_KEEPINTVL", 15),
+                    ("TCP_KEEPCNT", 4),
+                ):
+                    if hasattr(socket, opt):
+                        sock.setsockopt(
+                            socket.IPPROTO_TCP, getattr(socket, opt), value
+                        )
+
+    async def _supervisor(self) -> None:
+        """Rebuild the connection whenever it drops, until disconnect().
+
+        Backoff is deliberately not a flat RECONNECT_DELAY: when the Clipsal CNI
+        has a stale TCP slot, C-Gate itself loops open -> error -> reopen every
+        15s, and a fixed 15s retry would sit in lockstep with it and fill the
+        log. Only the first failure of a run is logged at WARNING.
+        """
+        while not self._closing:
+            await self._reconnect_event.wait()
+            if self._closing:
+                return
+
+            await self._close_sockets_and_listeners()
+
+            delay = RECONNECT_DELAY
+            attempt = 0
+            while not self._closing:
+                try:
+                    await self._connect_once()
+                except (CGateConnectionError, TimeoutError, OSError) as err:
+                    attempt += 1
+                    log = _LOGGER.warning if attempt == 1 else _LOGGER.debug
+                    log(
+                        "C-Gate reconnect attempt %d failed (%s); retrying in %ds",
+                        attempt,
+                        err,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, RECONNECT_DELAY_MAX)
+                else:
+                    _LOGGER.info(
+                        "C-Gate reconnected to %s:%s", self.host, self.command_port
+                    )
+                    break
+
     async def disconnect(self) -> None:
-        """Disconnect from the C-Gate server."""
+        """Disconnect for good and stop the reconnect supervisor."""
+        self._closing = True
+        self._reconnect_event.set()
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._supervisor_task
+            self._supervisor_task = None
+        await self._close_sockets_and_listeners()
+
+    async def _close_sockets_and_listeners(self) -> None:
+        """Tear down sockets and listener tasks.
+
+        Deliberately does not touch _supervisor_task: the supervisor calls this
+        while reconnecting, and cancelling itself mid-teardown would kill the
+        reconnect loop permanently.
+        """
         self._connected = False
 
         for task in (self._keepalive_task, self._scp_task, self._event_task):
@@ -384,9 +552,20 @@ class CGateClient:
 
         response_lines: list[str] = []
         while True:
-            line = await asyncio.wait_for(
-                self._cmd_reader.readline(), timeout=30
-            )
+            try:
+                line = await asyncio.wait_for(
+                    self._cmd_reader.readline(), timeout=30
+                )
+            except (TimeoutError, OSError) as err:
+                # Do NOT let this escape with the reader mid-stream. The lock is
+                # released on the way out, so the next command would write and
+                # then read *this* command's late reply -- silently returning one
+                # channel's value for another. Kill the socket instead and let
+                # the supervisor rebuild it.
+                self._mark_disconnected(f"command port read failed: {err}")
+                raise CGateConnectionError(
+                    f"No response to {command!r} from C-Gate"
+                ) from err
             text = line.decode("ascii", errors="replace").strip()
             if not text:
                 continue
@@ -443,6 +622,11 @@ class CGateClient:
             return 0
         try:
             response = await self._send_command(f"GET {group.address} level")
+        except CGateConnectionError:
+            # The link died mid-poll. This says nothing about the group, so it
+            # must not be latched as virtual -- doing so would silently and
+            # permanently kill a real light after one reconnect race.
+            return group.level
         except CGateCommandError:
             group.level = 0
             group.is_virtual = True
@@ -455,6 +639,94 @@ class CGateClient:
         if match:
             group.level = int(match.group(1))
         return group.level
+
+    async def read_measurement(
+        self, network: int, device: int, channel: int
+    ) -> bool:
+        """Poll one measurement channel. Returns True if a reading was stored.
+
+        Uses a fully-qualified address so it works regardless of session state.
+        A network-relative address only resolves after PROJECT USE, which cannot
+        be assumed to survive an unattended reconnect -- that exact assumption is
+        what silently froze the Node-RED bridge for hours on 2026-08-26.
+        """
+        address = (
+            f"//{self.project_name}/{network}/"
+            f"{CBUS_MEASUREMENT_APPLICATION}/{device}/{channel}"
+        )
+        response = await self._send_command(f"GET {address} Data")
+
+        match = MEASUREMENT_DATA_RESPONSE_PATTERN.match(response)
+        if not match:
+            _LOGGER.debug("Unparsed measurement response for %s: %s", address, response)
+            return False
+
+        # Verify the reply is for what we asked. EVENT e5s1c1 makes C-Gate emit
+        # asynchronous lines on this same session, so a mismatched address means
+        # we picked up someone else's frame and must not store it as ours.
+        if (
+            int(match.group(2)) != network
+            or int(match.group(4)) != device
+            or int(match.group(5)) != channel
+        ):
+            _LOGGER.debug(
+                "Measurement response address mismatch: asked %s, got %s",
+                address,
+                response,
+            )
+            return False
+
+        self._update_measurement(
+            network=network,
+            application=int(match.group(3)),
+            device=device,
+            channel=channel,
+            raw_value=int(match.group(6)),
+            exponent=int(match.group(7)),
+            units=int(match.group(8)),
+        )
+        return True
+
+    async def async_refresh_measurements(
+        self, channels: list[tuple[int, int, int]]
+    ) -> int:
+        """Poll each (network, device, channel) in turn. Returns success count.
+
+        Sequential on purpose: every command already serialises behind
+        _cmd_lock, and firing these concurrently would only queue them ahead of
+        user-initiated commands such as a light switch press.
+        """
+        found = 0
+        for network, device, channel in channels:
+            try:
+                if await self.read_measurement(network, device, channel):
+                    found += 1
+            except CGateCommandError:
+                continue  # channel does not exist on this device
+            except CGateConnectionError:
+                raise  # link is down; supervisor handles it, stop polling
+        return found
+
+    async def scan_measurement_channels(
+        self, networks: list[int] | None = None
+    ) -> list[tuple[int, int, int]]:
+        """Probe for measurement channels. Only for a first run; bounded."""
+        if not networks:
+            networks = sorted(
+                {g.network for g in self._groups.values()}
+            ) or [DEFAULT_MEASUREMENT_NETWORK]
+
+        found: list[tuple[int, int, int]] = []
+        for network in networks:
+            for device in range(MEASUREMENT_SCAN_MAX_DEVICE + 1):
+                for channel in range(MEASUREMENT_SCAN_MAX_CHANNEL + 1):
+                    try:
+                        if await self.read_measurement(network, device, channel):
+                            found.append((network, device, channel))
+                    except CGateCommandError:
+                        continue
+        _LOGGER.debug("Measurement scan found %d channels", len(found))
+        return found
 
     async def _fetch_xml_groups(
         self, application: int
@@ -534,28 +806,6 @@ class CGateClient:
 
         return discovered
 
-    async def discover_measurement_channels(self) -> list[CGateGroup]:
-        """Discover measurement channels via DBGETXML.
-
-        Returns CGateGroup objects for application 228 channels.
-        These are NOT stored in self._groups to avoid mixing with lighting groups.
-        """
-        group_defs = await self._fetch_xml_groups(CBUS_MEASUREMENT_APPLICATION)
-
-        channels: list[CGateGroup] = []
-        for gdef in group_defs:
-            channels.append(CGateGroup(
-                network=int(gdef["network"]),
-                application=int(gdef["application"]),
-                group=int(gdef["group"]),
-                name=str(gdef["name"]),
-            ))
-
-        _LOGGER.info(
-            "Discovered %d measurement channels from C-Gate XML database",
-            len(channels),
-        )
-        return channels
 
     async def _keepalive_loop(self) -> None:
         """Send periodic NOOP commands to keep the connection alive."""
@@ -566,9 +816,8 @@ class CGateClient:
                     await self._send_command("NOOP")
             except CGateCommandError:
                 _LOGGER.warning("Keepalive NOOP failed")
-            except (TimeoutError, OSError):
-                _LOGGER.error("C-Gate keepalive connection lost")
-                self._connected = False
+            except (TimeoutError, OSError) as err:
+                self._mark_disconnected(f"keepalive failed: {err}")
                 break
             except asyncio.CancelledError:
                 return
@@ -582,7 +831,7 @@ class CGateClient:
             try:
                 line = await self._scp_reader.readline()
                 if not line:
-                    _LOGGER.warning("C-Gate SCP connection closed")
+                    self._mark_disconnected("SCP connection closed")
                     break
                 text = line.decode("ascii", errors="replace").strip()
                 if not text:
@@ -593,8 +842,8 @@ class CGateClient:
 
             except asyncio.CancelledError:
                 return
-            except (TimeoutError, OSError):
-                _LOGGER.error("C-Gate SCP connection lost")
+            except (TimeoutError, OSError) as err:
+                self._mark_disconnected(f"SCP socket error: {err}")
                 break
 
     async def _event_listener(self) -> None:
@@ -606,7 +855,7 @@ class CGateClient:
             try:
                 line = await self._event_reader.readline()
                 if not line:
-                    _LOGGER.warning("C-Gate event connection closed")
+                    self._mark_disconnected("event connection closed")
                     break
                 text = line.decode("ascii", errors="replace").strip()
                 if not text:
@@ -614,8 +863,8 @@ class CGateClient:
                 _LOGGER.debug("C-Gate EVT: %s", text)
             except asyncio.CancelledError:
                 return
-            except (TimeoutError, OSError):
-                _LOGGER.error("C-Gate event connection lost")
+            except (TimeoutError, OSError) as err:
+                self._mark_disconnected(f"event socket error: {err}")
                 break
 
     def _handle_scp_event(self, text: str) -> None:
@@ -661,22 +910,44 @@ class CGateClient:
 
         SCP format: measurement data //PROJECT/NET/228/DEVICE/CHANNEL VALUE EXP UNITS #sourceunit=X
         """
-        network = int(match.group(2))
-        application = int(match.group(3))
-        device = int(match.group(4))
-        channel = int(match.group(5))
-        raw_value = int(match.group(6))
-        exponent = int(match.group(7))
-        units = int(match.group(8))
-        source_unit = int(match.group(9)) if match.group(9) else 0
+        self._update_measurement(
+            network=int(match.group(2)),
+            application=int(match.group(3)),
+            device=int(match.group(4)),
+            channel=int(match.group(5)),
+            raw_value=int(match.group(6)),
+            exponent=int(match.group(7)),
+            units=int(match.group(8)),
+            source_unit=int(match.group(9)) if match.group(9) else 0,
+        )
 
+    def _update_measurement(
+        self,
+        *,
+        network: int,
+        application: int,
+        device: int,
+        channel: int,
+        raw_value: int,
+        exponent: int,
+        units: int,
+        source_unit: int | None = None,
+    ) -> CGateMeasurement:
+        """Store a reading and notify subscribers.
+
+        Shared by the SCP event path and the poll path. source_unit is None for
+        polled readings, because the "300 ... Data=" response carries no
+        #sourceunit -- it must leave any event-derived value alone rather than
+        overwrite it with 0.
+        """
         uid = f"{network}_{application}_{device}_{channel}"
         if uid in self._measurements:
             meas = self._measurements[uid]
             meas.raw_value = raw_value
             meas.exponent = exponent
             meas.units = units
-            meas.source_unit = source_unit
+            if source_unit is not None:
+                meas.source_unit = source_unit
         else:
             meas = CGateMeasurement(
                 network=network,
@@ -686,15 +957,19 @@ class CGateClient:
                 raw_value=raw_value,
                 exponent=exponent,
                 units=units,
-                source_unit=source_unit,
+                source_unit=source_unit or 0,
             )
             self._measurements[uid] = meas
+
+        meas.last_seen = time.monotonic()
 
         for callback in self._measurement_callbacks:
             try:
                 callback(meas)
             except Exception:
                 _LOGGER.exception("Error in measurement callback")
+
+        return meas
 
     def _get_or_create_group(
         self, network: int, application: int, group: int
