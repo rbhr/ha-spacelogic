@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 from custom_components.spacelogic_cgate.cgate import (
@@ -10,6 +11,7 @@ from custom_components.spacelogic_cgate.cgate import (
     CGateGroup,
     CGateMeasurement,
 )
+from custom_components.spacelogic_cgate.const import DEFAULT_MEASUREMENT_STALE_AFTER
 from custom_components.spacelogic_cgate.cover import CGateCover
 from custom_components.spacelogic_cgate.fan import CGateFan
 from custom_components.spacelogic_cgate.lock import CGateLock
@@ -76,6 +78,10 @@ def _make_sensor(
         network=254, application=228, device=device, channel=channel,
         raw_value=raw_value, exponent=exponent, units=units,
     )
+    # Production only ever builds a measurement via CGateClient._update_measurement,
+    # which stamps last_seen. Availability is gated on that timestamp, so a fixture
+    # without it would look permanently stale.
+    meas.last_seen = time.monotonic()
     client._measurements[meas.unique_id] = meas
     entity = object.__new__(CGateMeasurementSensor)
     # Initialize mock internals so __setattr__/__getattr__ work properly
@@ -296,6 +302,25 @@ class TestCGateMeasurementSensor:
         sensor = _make_sensor(mock_cgate_client)
         assert sensor.available is True
         mock_cgate_client._connected = False
+        assert sensor.available is False
+
+    def test_unavailable_when_reading_goes_stale(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A channel that stops reporting must not hold its last value forever."""
+        sensor = _make_sensor(mock_cgate_client)
+        assert sensor.available is True
+        sensor._measurement.last_seen = (
+            time.monotonic() - DEFAULT_MEASUREMENT_STALE_AFTER - 1
+        )
+        assert sensor.available is False
+
+    def test_unavailable_before_first_reading(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A channel that has never reported has no value worth showing."""
+        sensor = _make_sensor(mock_cgate_client)
+        sensor._measurement.last_seen = 0.0
         assert sensor.available is False
 
 
