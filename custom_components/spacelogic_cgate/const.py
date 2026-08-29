@@ -24,10 +24,29 @@ CONF_PROJECT_NAME = "project_name"
 RESPONSE_OK = 200
 RESPONSE_SERVICE_READY = 201
 RESPONSE_OBJECT_INFO = 300
+# "Bad object or device ID" — what a group with no physical unit answers to
+# GET level. Permanent for that group, unlike any other error code.
+RESPONSE_NO_SUCH_OBJECT = 401
 
 # C-Gate keepalive
 DEFAULT_KEEPALIVE_INTERVAL = 60  # seconds
-RECONNECT_DELAY = 15  # seconds
+
+# Reconnect backoff. A C-Gate that is down usually stays down for a while
+# (a restart, a reboot, a network outage), so the delay grows rather than
+# hammering the host, and jitter keeps the three ports from redialling in
+# lockstep after the same outage.
+RECONNECT_INITIAL_DELAY = 2  # seconds
+RECONNECT_MAX_DELAY = 60  # seconds
+RECONNECT_BACKOFF_FACTOR = 2
+RECONNECT_JITTER_FRACTION = 0.2
+
+# TCP keepalive. The event and status ports are legitimately silent whenever
+# the C-Bus network is quiet, so an idle read timeout there would recycle a
+# perfectly healthy connection. Keepalive probes are what detect a peer that
+# has gone away without closing the socket.
+TCP_KEEPALIVE_IDLE = 30  # seconds of silence before the first probe
+TCP_KEEPALIVE_INTERVAL = 10  # seconds between probes
+TCP_KEEPALIVE_COUNT = 3  # unanswered probes before the socket errors
 
 # C-Bus applications
 CBUS_LIGHTING_APPLICATION = 56  # 0x38

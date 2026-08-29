@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import re
+import socket
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -14,7 +16,15 @@ from .const import (
     CBUS_LIGHTING_APPLICATION,
     CBUS_MEASUREMENT_APPLICATION,
     DEFAULT_KEEPALIVE_INTERVAL,
+    RECONNECT_BACKOFF_FACTOR,
+    RECONNECT_INITIAL_DELAY,
+    RECONNECT_JITTER_FRACTION,
+    RECONNECT_MAX_DELAY,
+    RESPONSE_NO_SUCH_OBJECT,
     RESPONSE_SERVICE_READY,
+    TCP_KEEPALIVE_COUNT,
+    TCP_KEEPALIVE_IDLE,
+    TCP_KEEPALIVE_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -64,6 +74,16 @@ class CGateConnectionError(Exception):
 
 class CGateCommandError(Exception):
     """Raised when a C-Gate command fails."""
+
+    def __init__(self, message: str, code: int | None = None) -> None:
+        """Store the C-Gate response code alongside the message.
+
+        The code is what tells a permanent failure from a transient one: 401
+        means the group has no physical unit and will never answer, while a
+        4xx from a C-Gate that is still starting up is worth retrying.
+        """
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -115,6 +135,38 @@ class CGateMeasurement:
     def unique_id(self) -> str:
         """Return a unique identifier for this measurement."""
         return f"{self.network}_{self.application}_{self.device}_{self.channel}"
+
+
+def _enable_keepalive(writer: asyncio.StreamWriter | None) -> None:
+    """Turn on TCP keepalive for a C-Gate connection.
+
+    None of the three ports carries an idle read timeout: the event and status
+    ports are legitimately silent whenever the C-Bus network is quiet, and
+    recycling them on a timer would drop status changes during every reconnect
+    for no gain. Keepalive probes are what notice a peer that has gone away
+    without closing the socket — otherwise a listener blocked in readline()
+    waits for a FIN that is never coming.
+
+    The per-socket tuning options are Linux names; where they are missing the
+    socket still gets keepalive at the OS default interval.
+    """
+    if writer is None:
+        return
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (
+            ("TCP_KEEPIDLE", TCP_KEEPALIVE_IDLE),
+            ("TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL),
+            ("TCP_KEEPCNT", TCP_KEEPALIVE_COUNT),
+        ):
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+    except OSError as err:
+        _LOGGER.debug("Could not enable TCP keepalive: %s", err)
 
 
 def _element_value(element: ET.Element, key: str) -> str | None:
@@ -240,8 +292,16 @@ class CGateClient:
     _scp_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _event_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _connected: bool = field(default=False, repr=False)
+    _closing: bool = field(default=False, repr=False)
+    _supervisor_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _connection_lost: asyncio.Event = field(
+        default_factory=asyncio.Event, repr=False
+    )
     _groups: dict[str, CGateGroup] = field(default_factory=dict, repr=False)
     _status_callbacks: list[Callable[[CGateGroup], None]] = field(
+        default_factory=list, repr=False
+    )
+    _connection_callbacks: list[Callable[[bool], None]] = field(
         default_factory=list, repr=False
     )
     _measurements: dict[str, CGateMeasurement] = field(
@@ -288,8 +348,59 @@ class CGateClient:
 
         return unsubscribe
 
+    def register_connection_callback(
+        self, callback: Callable[[bool], None]
+    ) -> Callable[[], None]:
+        """Register a callback for connection state changes.
+
+        Entities gate `available` on `connected`, and nothing else writes their
+        state when the link comes and goes, so without this an entity would keep
+        showing a level it can no longer verify. Returns an unsubscribe function.
+        """
+        self._connection_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            self._connection_callbacks.remove(callback)
+
+        return unsubscribe
+
     async def connect(self) -> None:
-        """Connect to the C-Gate server."""
+        """Connect to C-Gate and keep the connection up from then on.
+
+        The first attempt is synchronous and raises, so setup can report a
+        C-Gate that is unreachable at startup and let Home Assistant retry the
+        entry. Once it succeeds a supervisor task owns the connection: every
+        later failure is handled by redialling with backoff rather than by
+        leaving the integration dead until someone reloads it.
+        """
+        self._closing = False
+        self._connection_lost.clear()
+        await self._open()
+        self._supervisor_task = asyncio.create_task(self._supervisor())
+
+    async def disconnect(self) -> None:
+        """Disconnect from the C-Gate server and stop reconnecting."""
+        self._closing = True
+        # Wake the supervisor so it observes _closing and returns rather than
+        # sitting on the event until its task is cancelled mid-await.
+        self._connection_lost.set()
+
+        supervisor = self._supervisor_task
+        self._supervisor_task = None
+        if supervisor is not None:
+            supervisor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await supervisor
+
+        await self._teardown()
+        _LOGGER.debug("C-Gate client disconnected")
+
+    async def _open(self) -> None:
+        """Dial all three ports and complete the C-Gate handshake.
+
+        Raises CGateConnectionError if any part of that fails, having first put
+        the sockets back to a clean state so the caller can simply try again.
+        """
         try:
             # Connect command port (large buffer for DBGETXML responses)
             cmd_reader, cmd_writer = await asyncio.wait_for(
@@ -299,6 +410,7 @@ class CGateClient:
                 timeout=10,
             )
             self._cmd_reader, self._cmd_writer = cmd_reader, cmd_writer
+            _enable_keepalive(cmd_writer)
             # Wait for 201 Service Ready
             greeting = await asyncio.wait_for(cmd_reader.readline(), timeout=10)
             greeting_text = greeting.decode("ascii", errors="replace").strip()
@@ -313,6 +425,7 @@ class CGateClient:
                 asyncio.open_connection(self.host, self.status_change_port),
                 timeout=10,
             )
+            _enable_keepalive(self._scp_writer)
             _LOGGER.debug("C-Gate SCP connected")
 
             # Connect event port
@@ -320,6 +433,7 @@ class CGateClient:
                 asyncio.open_connection(self.host, self.event_port),
                 timeout=10,
             )
+            _enable_keepalive(self._event_writer)
             _LOGGER.debug("C-Gate event port connected")
 
             self._connected = True
@@ -337,13 +451,31 @@ class CGateClient:
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
         except (TimeoutError, OSError) as err:
-            await self.disconnect()
+            await self._teardown()
             raise CGateConnectionError(
                 f"Failed to connect to C-Gate at {self.host}:{self.command_port}"
             ) from err
+        except CGateCommandError as err:
+            # The sockets are up but the project never loaded, so the session is
+            # useless as it stands. Treat it as a connection failure: it is the
+            # reconnect path, not the caller, that knows how to retry forever.
+            await self._teardown()
+            raise CGateConnectionError(
+                f"C-Gate rejected the session for project {self.project_name}: {err}"
+            ) from err
+        except CGateConnectionError:
+            await self._teardown()
+            raise
 
-    async def disconnect(self) -> None:
-        """Disconnect from the C-Gate server."""
+        self._notify_connection_state(True)
+
+    async def _teardown(self) -> None:
+        """Close the sockets and stop the listeners, leaving the client idle.
+
+        Deliberately does not touch the supervisor task: this runs *from* the
+        supervisor on every reconnect, and cancelling itself there would end the
+        one thing keeping the connection alive.
+        """
         self._connected = False
 
         for task in (self._keepalive_task, self._scp_task, self._event_task):
@@ -358,7 +490,7 @@ class CGateClient:
         for writer in (self._cmd_writer, self._scp_writer, self._event_writer):
             if writer is not None:
                 writer.close()
-                with contextlib.suppress(OSError):
+                with contextlib.suppress(OSError, asyncio.TimeoutError):
                     await writer.wait_closed()
         self._cmd_writer = None
         self._scp_writer = None
@@ -367,26 +499,137 @@ class CGateClient:
         self._scp_reader = None
         self._event_reader = None
 
-        _LOGGER.debug("C-Gate client disconnected")
+    def _notify_connection_state(self, connected: bool) -> None:
+        """Tell subscribers the link came up or went down."""
+        for callback in list(self._connection_callbacks):
+            try:
+                callback(connected)
+            except Exception:  # noqa: BLE001 - a bad subscriber must not stop the rest
+                _LOGGER.exception("Error in connection callback")
+
+    def _connection_failed(self, reason: str) -> None:
+        """Record that the connection is gone and wake the supervisor.
+
+        Safe to call from any of the three listeners, the keepalive, or a
+        command that failed mid-flight — only the first caller does anything, so
+        several of them noticing the same outage still produces one reconnect.
+        """
+        if self._closing or not self._connected:
+            return
+        self._connected = False
+        _LOGGER.warning("C-Gate connection lost: %s", reason)
+        self._notify_connection_state(False)
+        self._connection_lost.set()
+
+    async def _supervisor(self) -> None:
+        """Redial C-Gate, with backoff, for as long as the entry is loaded."""
+        while not self._closing:
+            await self._connection_lost.wait()
+            if self._closing:
+                return
+
+            delay: float = RECONNECT_INITIAL_DELAY
+            while not self._closing:
+                await self._teardown()
+                # Cleared per attempt, not once per outage. A handshake that
+                # times out flags the loss on its way out, and clearing only at
+                # the top would leave that flag set on the attempt that finally
+                # works — sending the supervisor straight back round to rebuild
+                # a connection it has just built.
+                self._connection_lost.clear()
+                try:
+                    await self._open()
+                except CGateConnectionError as err:
+                    # Jittered so a site running more than one integration
+                    # against the same C-Gate does not redial in lockstep.
+                    wait = delay + random.uniform(0, delay * RECONNECT_JITTER_FRACTION)
+                    _LOGGER.debug(
+                        "C-Gate reconnect failed (%s); retrying in %.1fs", err, wait
+                    )
+                    await asyncio.sleep(wait)
+                    delay = min(delay * RECONNECT_BACKOFF_FACTOR, RECONNECT_MAX_DELAY)
+                    continue
+
+                _LOGGER.info("Reconnected to C-Gate at %s", self.host)
+                await self._resync_state()
+                break
+
+    async def _resync_state(self) -> None:
+        """Re-read every known group's level after a reconnect.
+
+        Status changes that happened while the SCP socket was down are gone —
+        C-Gate does not backfill — so without this every entity would keep
+        showing whatever was true before the outage.
+        """
+        groups = list(self._groups.values())
+        resynced = 0
+        for group in groups:
+            if not self._connected:
+                # Dropped again mid-resync. Stop rather than working through
+                # the rest of the groups one doomed command at a time.
+                _LOGGER.debug("Resync abandoned: C-Gate went away again")
+                break
+            level = await self.try_get_level(group)
+            if level is None:
+                # A read that failed says nothing about the group. Skipping it
+                # leaves the last known level in place; treating it as 0 would
+                # switch the entity off in Home Assistant on a partial resync.
+                continue
+            group.level = level
+            resynced += 1
+            self._notify_status(group)
+
+        _LOGGER.info(
+            "Resynchronised %d of %d groups after reconnect", resynced, len(groups)
+        )
+
+    def _notify_status(self, group: CGateGroup) -> None:
+        """Push a group's current state to subscribers."""
+        for callback in list(self._status_callbacks):
+            try:
+                callback(group)
+            except Exception:  # noqa: BLE001 - a bad subscriber must not stop the rest
+                _LOGGER.exception("Error in status callback")
 
     async def _send_receive(self, command: str) -> list[str]:
         """Send a command and return all response lines.
 
         Must be called with _cmd_lock held.
-        Raises CGateCommandError on failure responses (4xx, 5xx).
+        Raises CGateCommandError on failure responses (4xx, 5xx), and
+        CGateConnectionError if the command port is down or dies mid-command —
+        which also wakes the supervisor, so a caller gets a prompt failure
+        instead of hanging while the link is rebuilt.
         """
-        if not self._cmd_writer or not self._cmd_reader:
+        # Read the pair once. A reconnect replaces both, and a command that
+        # started against the old socket must not finish against the new one.
+        reader, writer = self._cmd_reader, self._cmd_writer
+        if reader is None or writer is None:
             raise CGateConnectionError("Not connected to C-Gate")
 
         _LOGGER.debug("C-Gate TX: %s", command)
-        self._cmd_writer.write(f"{command}\r\n".encode("ascii"))
-        await self._cmd_writer.drain()
+        try:
+            writer.write(f"{command}\r\n".encode("ascii"))
+            await writer.drain()
+        except (TimeoutError, OSError) as err:
+            self._connection_failed(f"write failed: {err}")
+            raise CGateConnectionError(f"Failed to send {command}: {err}") from err
 
         response_lines: list[str] = []
         while True:
-            line = await asyncio.wait_for(
-                self._cmd_reader.readline(), timeout=30
-            )
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=30)
+            except (TimeoutError, OSError) as err:
+                self._connection_failed(f"no reply to {command}: {err!r}")
+                raise CGateConnectionError(
+                    f"Timed out waiting for a reply to {command}"
+                ) from err
+
+            if not line:
+                # readline() returns b"" at EOF and keeps doing so. Without this
+                # the blank-line skip below would spin on a closed socket.
+                self._connection_failed("command port closed by C-Gate")
+                raise CGateConnectionError("C-Gate closed the command connection")
+
             text = line.decode("ascii", errors="replace").strip()
             if not text:
                 continue
@@ -399,11 +642,9 @@ class CGateClient:
                 code = int(match.group(1))
                 if code >= 400:
                     raise CGateCommandError(
-                        f"C-Gate error {code}: {match.group(2)}"
+                        f"C-Gate error {code}: {match.group(2)}", code=code
                     )
                 return response_lines
-
-        return response_lines
 
     async def _send_command(self, command: str) -> str:
         """Send a command and return the final response line."""
@@ -431,29 +672,65 @@ class CGateClient:
         await self._send_command(cmd)
         group.level = level
 
+    async def try_get_level(self, group: CGateGroup) -> int | None:
+        """Read a group's level, returning None when the read did not succeed.
+
+        Distinguishes "the group is at 0" from "we could not find out", which
+        get_level cannot. Folding the two together is harmless when seeding a
+        group that already defaults to 0, and wrong when resynchronising after
+        an outage: a failed read treated as 0 switches the entity off in Home
+        Assistant even though nothing about the light changed.
+        """
+        if group.is_virtual:
+            return None
+        try:
+            response = await self._send_command(f"GET {group.address} level")
+        except CGateCommandError as err:
+            # Only 401 means "no physical unit", which is a permanent property
+            # of the group. Any other error is a fault in the exchange, and
+            # flagging the group on one of those would take a real light out of
+            # polling for the life of the process.
+            if err.code == RESPONSE_NO_SUCH_OBJECT:
+                group.is_virtual = True
+                _LOGGER.debug(
+                    "Group %s has no physical unit; marking as virtual",
+                    group.address,
+                )
+            else:
+                _LOGGER.debug(
+                    "GET level failed for group %s: %s", group.address, err
+                )
+            return None
+        except CGateConnectionError as err:
+            _LOGGER.debug("GET level for group %s: %s", group.address, err)
+            return None
+
+        match = LEVEL_RESPONSE_PATTERN.match(response)
+        if match:
+            return int(match.group(1))
+        _LOGGER.warning("Unexpected GET level response: %s", response)
+        return None
+
     async def get_level(self, group: CGateGroup) -> int:
         """Get the current level of a C-Bus group.
 
-        Virtual groups (no physical unit) return a 401 error from C-Gate.
-        When this happens, the group is marked as virtual so future polls
-        skip the command entirely.
+        Virtual groups (no physical unit) return a 401 error from C-Gate. When
+        this happens, the group is marked as virtual so future polls skip the
+        command entirely, and it reports 0 — it has no level to report.
+
+        Any other failed read leaves the last known level alone rather than
+        reporting 0. Use try_get_level when you need to tell the two apart.
         """
         if group.is_virtual:
             group.level = 0
             return 0
-        try:
-            response = await self._send_command(f"GET {group.address} level")
-        except CGateCommandError:
+
+        level = await self.try_get_level(group)
+        if level is not None:
+            group.level = level
+        elif group.is_virtual:
+            # try_get_level just discovered it is virtual.
             group.level = 0
-            group.is_virtual = True
-            _LOGGER.debug(
-                "Group %s returned error on GET level; marking as virtual",
-                group.address,
-            )
-            return group.level
-        match = LEVEL_RESPONSE_PATTERN.match(response)
-        if match:
-            group.level = int(match.group(1))
         return group.level
 
     async def _fetch_xml_groups(
@@ -558,65 +835,83 @@ class CGateClient:
         return channels
 
     async def _keepalive_loop(self) -> None:
-        """Send periodic NOOP commands to keep the connection alive."""
-        while self._connected:
+        """Send periodic NOOP commands to keep the connection alive.
+
+        Silence on the command port is not normal — this loop feeds it — so a
+        NOOP that does not come back means the port has wedged and is worth
+        recycling, unlike silence on the event and status ports.
+        """
+        while True:
             try:
                 await asyncio.sleep(DEFAULT_KEEPALIVE_INTERVAL)
-                if self._connected:
-                    await self._send_command("NOOP")
-            except CGateCommandError:
-                _LOGGER.warning("Keepalive NOOP failed")
-            except (TimeoutError, OSError):
-                _LOGGER.error("C-Gate keepalive connection lost")
-                self._connected = False
-                break
+                if not self._connected:
+                    return
+                await self._send_command("NOOP")
             except asyncio.CancelledError:
+                return
+            except CGateCommandError as err:
+                # C-Gate answered, just not with success. The link is fine.
+                _LOGGER.warning("Keepalive NOOP failed: %s", err)
+            except CGateConnectionError:
+                # _send_receive has already reported the loss and woken the
+                # supervisor; this task is about to be cancelled by the
+                # teardown, so just stop.
+                return
+            except (TimeoutError, OSError) as err:
+                self._connection_failed(f"keepalive failed: {err}")
                 return
 
     async def _scp_listener(self) -> None:
         """Listen for status change events on the SCP port."""
-        if not self._scp_reader:
+        # Bind the reader once: a reconnect replaces it, and this task must not
+        # start reading the new socket in place of the one it was started for.
+        reader = self._scp_reader
+        if reader is None:
             return
 
-        while self._connected:
+        while True:
             try:
-                line = await self._scp_reader.readline()
-                if not line:
-                    _LOGGER.warning("C-Gate SCP connection closed")
-                    break
-                text = line.decode("ascii", errors="replace").strip()
-                if not text:
-                    continue
-
-                _LOGGER.debug("C-Gate SCP: %s", text)
-                self._handle_scp_event(text)
-
+                line = await reader.readline()
             except asyncio.CancelledError:
                 return
-            except (TimeoutError, OSError):
-                _LOGGER.error("C-Gate SCP connection lost")
-                break
+            except (TimeoutError, OSError) as err:
+                self._connection_failed(f"status port lost: {err}")
+                return
+
+            if not line:
+                self._connection_failed("status port closed by C-Gate")
+                return
+
+            text = line.decode("ascii", errors="replace").strip()
+            if not text:
+                continue
+
+            _LOGGER.debug("C-Gate SCP: %s", text)
+            self._handle_scp_event(text)
 
     async def _event_listener(self) -> None:
         """Listen for events on the event port."""
-        if not self._event_reader:
+        reader = self._event_reader
+        if reader is None:
             return
 
-        while self._connected:
+        while True:
             try:
-                line = await self._event_reader.readline()
-                if not line:
-                    _LOGGER.warning("C-Gate event connection closed")
-                    break
-                text = line.decode("ascii", errors="replace").strip()
-                if not text:
-                    continue
-                _LOGGER.debug("C-Gate EVT: %s", text)
+                line = await reader.readline()
             except asyncio.CancelledError:
                 return
-            except (TimeoutError, OSError):
-                _LOGGER.error("C-Gate event connection lost")
-                break
+            except (TimeoutError, OSError) as err:
+                self._connection_failed(f"event port lost: {err}")
+                return
+
+            if not line:
+                self._connection_failed("event port closed by C-Gate")
+                return
+
+            text = line.decode("ascii", errors="replace").strip()
+            if not text:
+                continue
+            _LOGGER.debug("C-Gate EVT: %s", text)
 
     def _handle_scp_event(self, text: str) -> None:
         """Parse and handle a status change event."""
@@ -649,12 +944,7 @@ class CGateClient:
             # C-Gate SCP ramp reports level as 0-255 native C-Bus value
             group.level = int(level_str)
 
-        # Notify listeners
-        for callback in self._status_callbacks:
-            try:
-                callback(group)
-            except Exception:
-                _LOGGER.exception("Error in status callback")
+        self._notify_status(group)
 
     def _handle_measurement_event(self, match: re.Match[str]) -> None:
         """Handle a measurement SCP event.

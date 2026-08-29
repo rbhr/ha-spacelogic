@@ -203,10 +203,24 @@ class CGateMeasurementSensor(SensorEntity):
         if meas.unique_id == self._measurement.unique_id:
             self.async_write_ha_state()
 
+    @callback
+    def _handle_connection_change(self, connected: bool) -> None:
+        """Refresh availability when the C-Gate link comes or goes.
+
+        Nothing else writes this entity's state on an outage, so without it the
+        sensor would keep presenting a reading it can no longer verify.
+        """
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         """Register for measurement updates when entity is added."""
         self.async_on_remove(
             self._client.register_measurement_callback(
                 self._handle_measurement_update
+            )
+        )
+        self.async_on_remove(
+            self._client.register_connection_callback(
+                self._handle_connection_change
             )
         )

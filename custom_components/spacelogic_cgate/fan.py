@@ -153,10 +153,24 @@ class CGateFan(FanEntity):
         if group.unique_id == self._group.unique_id:
             self.async_write_ha_state()
 
+    @callback
+    def _handle_connection_change(self, connected: bool) -> None:
+        """Refresh availability when the C-Gate link comes or goes.
+
+        Nothing else writes this entity's state on an outage, so without it the
+        entity would keep presenting a level it can no longer verify.
+        """
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         """Register for status updates when entity is added."""
         self.async_on_remove(
             self._client.register_status_callback(self._handle_group_update)
+        )
+        self.async_on_remove(
+            self._client.register_connection_callback(
+                self._handle_connection_change
+            )
         )
 
     async def async_update(self) -> None:

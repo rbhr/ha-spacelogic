@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.spacelogic_cgate import cgate
 from custom_components.spacelogic_cgate.cgate import (
     LEVEL_RESPONSE_PATTERN,
     RESPONSE_PATTERN,
@@ -17,6 +18,7 @@ from custom_components.spacelogic_cgate.cgate import (
     SCP_MEASUREMENT_PATTERN,
     CGateClient,
     CGateCommandError,
+    CGateConnectionError,
     CGateGroup,
     CGateMeasurement,
     parse_xml_groups,
@@ -698,7 +700,9 @@ class TestGetLevel:
         group = CGateGroup(network=254, application=56, group=234)
         group.level = 99  # set a non-zero level to verify it gets reset
         mock_cgate_client._send_command = AsyncMock(
-            side_effect=CGateCommandError("C-Gate error 401: Bad object or device ID.")
+            side_effect=CGateCommandError(
+                "C-Gate error 401: Bad object or device ID.", code=401
+            )
         )
         level = asyncio.get_event_loop().run_until_complete(
             mock_cgate_client.get_level(group)
@@ -706,6 +710,43 @@ class TestGetLevel:
         assert level == 0
         assert group.level == 0
         assert group.is_virtual is True
+
+    def test_get_level_transient_error_keeps_last_level(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A non-401 error must not zero the level or retire the group.
+
+        C-Gate answers 4xx for plenty of transient reasons — mid-restart, a
+        network still syncing. Folding those onto 0 switches a light off in
+        Home Assistant, and flagging the group virtual takes it out of polling
+        for the life of the process.
+        """
+        group = CGateGroup(network=254, application=56, group=1)
+        group.level = 200
+        mock_cgate_client._send_command = AsyncMock(
+            side_effect=CGateCommandError("C-Gate error 408: Operation failed.", code=408)
+        )
+        level = asyncio.get_event_loop().run_until_complete(
+            mock_cgate_client.get_level(group)
+        )
+        assert level == 200
+        assert group.level == 200
+        assert group.is_virtual is False
+
+    def test_get_level_connection_error_keeps_last_level(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """An outage mid-poll leaves the last known level in place."""
+        group = CGateGroup(network=254, application=56, group=1)
+        group.level = 128
+        mock_cgate_client._send_command = AsyncMock(
+            side_effect=CGateConnectionError("Not connected to C-Gate")
+        )
+        level = asyncio.get_event_loop().run_until_complete(
+            mock_cgate_client.get_level(group)
+        )
+        assert level == 128
+        assert group.is_virtual is False
 
     def test_get_level_virtual_group_skips_command(
         self, mock_cgate_client: CGateClient
@@ -718,3 +759,273 @@ class TestGetLevel:
         )
         assert level == 0
         mock_cgate_client._send_command.assert_not_called()
+
+
+class TestConnectionRecovery:
+    """Tests for the reconnect supervisor and what it does on the way back.
+
+    These drive the client through _open/_teardown with those stubbed, so they
+    exercise the recovery logic itself rather than asyncio's socket handling.
+    """
+
+    async def test_connect_failure_propagates(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """Setup must see the first failure, so HA can retry the entry."""
+        mock_cgate_client._connected = False
+        mock_cgate_client._open = AsyncMock(  # type: ignore[method-assign]
+            side_effect=CGateConnectionError("boom")
+        )
+
+        with pytest.raises(CGateConnectionError):
+            await CGateClient.connect(mock_cgate_client)
+
+        # No supervisor is left running behind a failed setup.
+        assert mock_cgate_client._supervisor_task is None
+
+    async def test_connect_starts_supervisor(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A successful connect leaves a supervisor owning the connection."""
+        mock_cgate_client._open = AsyncMock()  # type: ignore[method-assign]
+
+        await CGateClient.connect(mock_cgate_client)
+        try:
+            assert mock_cgate_client._supervisor_task is not None
+            assert not mock_cgate_client._supervisor_task.done()
+        finally:
+            mock_cgate_client._teardown = AsyncMock()  # type: ignore[method-assign]
+            await CGateClient.disconnect(mock_cgate_client)
+
+    async def test_connection_failed_is_idempotent(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """Several components noticing one outage produce one reconnect."""
+        states: list[bool] = []
+        mock_cgate_client.register_connection_callback(states.append)
+
+        mock_cgate_client._connection_failed("status port lost")
+        mock_cgate_client._connection_failed("event port lost")
+        mock_cgate_client._connection_failed("keepalive failed")
+
+        assert states == [False]
+        assert mock_cgate_client.connected is False
+        assert mock_cgate_client._connection_lost.is_set()
+
+    async def test_supervisor_retries_until_open_succeeds(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A dial that keeps failing is retried, not abandoned."""
+        attempts = 0
+        recovered = asyncio.Event()
+
+        async def flaky_open() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise CGateConnectionError("still down")
+            mock_cgate_client._connected = True
+            recovered.set()
+
+        mock_cgate_client._open = flaky_open  # type: ignore[method-assign]
+        mock_cgate_client._teardown = AsyncMock()  # type: ignore[method-assign]
+        mock_cgate_client._resync_state = AsyncMock()  # type: ignore[method-assign]
+
+        # Collapse the backoff rather than sleeping through 2s + 4s of it.
+        # Patched on the module so the supervisor picks it up by name; leaves
+        # asyncio.sleep itself real, which is what lets the loop yield.
+        with patch.object(cgate, "RECONNECT_INITIAL_DELAY", 0):
+            supervisor = asyncio.create_task(mock_cgate_client._supervisor())
+            mock_cgate_client._connection_failed("link dropped")
+            await asyncio.wait_for(recovered.wait(), timeout=5)
+
+        assert attempts == 3
+        mock_cgate_client._resync_state.assert_awaited_once()
+
+        mock_cgate_client._closing = True
+        mock_cgate_client._connection_lost.set()
+        await asyncio.wait_for(supervisor, timeout=5)
+
+    async def test_supervisor_settles_after_a_handshake_that_flagged_loss(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A reconnect must not immediately rebuild what it has just built.
+
+        A handshake that times out reports the loss on its way out. If that
+        flag survived into the attempt that finally worked, the supervisor
+        would loop straight back round and tear down a healthy connection.
+        """
+        opens = 0
+        recovered = asyncio.Event()
+
+        async def open_once_failing() -> None:
+            nonlocal opens
+            opens += 1
+            if opens == 1:
+                mock_cgate_client._connected = True
+                mock_cgate_client._connection_failed("handshake timed out")
+                raise CGateConnectionError("handshake timed out")
+            mock_cgate_client._connected = True
+            recovered.set()
+
+        mock_cgate_client._open = open_once_failing  # type: ignore[method-assign]
+        mock_cgate_client._teardown = AsyncMock()  # type: ignore[method-assign]
+        mock_cgate_client._resync_state = AsyncMock()  # type: ignore[method-assign]
+
+        with patch.object(cgate, "RECONNECT_INITIAL_DELAY", 0):
+            supervisor = asyncio.create_task(mock_cgate_client._supervisor())
+            mock_cgate_client._connection_failed("link dropped")
+            await asyncio.wait_for(recovered.wait(), timeout=5)
+            # Give the supervisor room to loop again if it were going to.
+            await asyncio.sleep(0.05)
+
+        assert opens == 2
+        assert not mock_cgate_client._connection_lost.is_set()
+
+        mock_cgate_client._closing = True
+        mock_cgate_client._connection_lost.set()
+        await asyncio.wait_for(supervisor, timeout=5)
+
+    async def test_resync_stops_when_the_link_drops_again(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A resync interrupted by a second outage gives up promptly."""
+        for group_num in (1, 2, 3):
+            group = CGateGroup(network=254, application=56, group=group_num)
+            mock_cgate_client._groups[group.unique_id] = group
+
+        reads = 0
+
+        async def drop_on_first_read(group: CGateGroup) -> int | None:
+            nonlocal reads
+            reads += 1
+            mock_cgate_client._connected = False
+            return None
+
+        mock_cgate_client.try_get_level = drop_on_first_read  # type: ignore[method-assign]
+
+        await mock_cgate_client._resync_state()
+
+        # One doomed command, not one per group.
+        assert reads == 1
+
+    async def test_resync_pushes_recovered_levels(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """Every group that answers is written back out to subscribers."""
+        group = CGateGroup(network=254, application=56, group=1, level=0)
+        mock_cgate_client._groups[group.unique_id] = group
+        updates: list[CGateGroup] = []
+        mock_cgate_client.register_status_callback(updates.append)
+        mock_cgate_client.try_get_level = AsyncMock(  # type: ignore[method-assign]
+            return_value=128
+        )
+
+        await mock_cgate_client._resync_state()
+
+        assert group.level == 128
+        assert updates == [group]
+
+    async def test_resync_skips_groups_that_do_not_answer(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A failed read must not be reported as level 0.
+
+        Treating it as 0 during a partial resync switches the entity off in
+        Home Assistant even though the light never changed.
+        """
+        group = CGateGroup(network=254, application=56, group=1, level=200)
+        mock_cgate_client._groups[group.unique_id] = group
+        updates: list[CGateGroup] = []
+        mock_cgate_client.register_status_callback(updates.append)
+        mock_cgate_client.try_get_level = AsyncMock(  # type: ignore[method-assign]
+            return_value=None
+        )
+
+        await mock_cgate_client._resync_state()
+
+        assert group.level == 200
+        assert updates == []
+
+    async def test_disconnect_stops_the_supervisor(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """Unloading the entry must not leave a task redialling forever."""
+        mock_cgate_client._open = AsyncMock()  # type: ignore[method-assign]
+        mock_cgate_client._teardown = AsyncMock()  # type: ignore[method-assign]
+
+        await CGateClient.connect(mock_cgate_client)
+        supervisor = mock_cgate_client._supervisor_task
+        assert supervisor is not None
+
+        await CGateClient.disconnect(mock_cgate_client)
+
+        assert supervisor.done()
+        assert mock_cgate_client._supervisor_task is None
+        assert mock_cgate_client._closing is True
+
+    async def test_connection_callback_unsubscribe(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """An entity removed from HA stops hearing about the connection."""
+        states: list[bool] = []
+        unsub = mock_cgate_client.register_connection_callback(states.append)
+
+        mock_cgate_client._notify_connection_state(True)
+        unsub()
+        mock_cgate_client._notify_connection_state(False)
+
+        assert states == [True]
+
+
+class TestCommandPortFailures:
+    """Tests for commands issued while the command port is unusable."""
+
+    async def test_send_receive_without_connection(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """A command during an outage fails now rather than hanging."""
+        mock_cgate_client._cmd_reader = None
+        mock_cgate_client._cmd_writer = None
+
+        with pytest.raises(CGateConnectionError):
+            await mock_cgate_client._send_receive("NOOP")
+
+    async def test_send_receive_eof_reports_loss(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """EOF on the command port ends the command and wakes the supervisor.
+
+        readline() returns b"" forever once the peer has gone, so treating it
+        as a blank line to skip would spin the loop hot instead.
+        """
+        reader = MagicMock()
+        reader.readline = AsyncMock(return_value=b"")
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        mock_cgate_client._cmd_reader = reader
+        mock_cgate_client._cmd_writer = writer
+
+        with pytest.raises(CGateConnectionError):
+            await mock_cgate_client._send_receive("NOOP")
+
+        assert mock_cgate_client.connected is False
+        assert mock_cgate_client._connection_lost.is_set()
+
+    async def test_command_error_carries_code(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """The response code is what separates 401 from a transient 4xx."""
+        reader = MagicMock()
+        reader.readline = AsyncMock(
+            return_value=b"401 Bad object or device ID.\r\n"
+        )
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        mock_cgate_client._cmd_reader = reader
+        mock_cgate_client._cmd_writer = writer
+
+        with pytest.raises(CGateCommandError) as excinfo:
+            await mock_cgate_client._send_receive("GET 254/56/1 level")
+
+        assert excinfo.value.code == 401

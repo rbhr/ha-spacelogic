@@ -7,8 +7,9 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
-from .cgate import CGateClient
+from .cgate import CGateClient, CGateConnectionError
 from .const import (
     CONF_COMMAND_PORT,
     CONF_EVENT_PORT,
@@ -46,12 +47,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: CGateConfigEntry) -> boo
         project_name=entry.data[CONF_PROJECT_NAME],
     )
 
-    await client.connect()
+    # Raise rather than return False so Home Assistant retries the entry with
+    # its own backoff. A C-Gate that is down when HA boots — the two often
+    # restart together — otherwise leaves the integration dead until someone
+    # reloads it by hand. Once this first attempt succeeds the client supervises
+    # its own connection and later outages never come back through here.
+    try:
+        await client.connect()
+    except CGateConnectionError as err:
+        raise ConfigEntryNotReady(str(err)) from err
+
     entry.runtime_data = client
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    entry.async_on_unload(client.disconnect)
     entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
 
     return True
