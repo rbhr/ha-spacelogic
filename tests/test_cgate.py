@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,6 +17,7 @@ from custom_components.spacelogic_cgate.cgate import (
     SCP_MEASUREMENT_PATTERN,
     CGateClient,
     CGateCommandError,
+    CGateConnectionError,
     CGateGroup,
     CGateMeasurement,
     parse_xml_groups,
@@ -698,7 +699,9 @@ class TestGetLevel:
         group = CGateGroup(network=254, application=56, group=234)
         group.level = 99  # set a non-zero level to verify it gets reset
         mock_cgate_client._send_command = AsyncMock(
-            side_effect=CGateCommandError("C-Gate error 401: Bad object or device ID.")
+            side_effect=CGateCommandError(
+                "C-Gate error 401: Bad object or device ID.", code=401
+            )
         )
         level = asyncio.get_event_loop().run_until_complete(
             mock_cgate_client.get_level(group)
@@ -706,6 +709,28 @@ class TestGetLevel:
         assert level == 0
         assert group.level == 0
         assert group.is_virtual is True
+
+    def test_get_level_transient_error_keeps_the_group(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """Only 401 retires a group; every other code is a passing fault.
+
+        C-Gate answers 408 for the first minute after start, while it syncs its
+        networks. Latching on that took a real light out of polling for the
+        life of the process, and reporting 0 switched it off in Home Assistant
+        on the way.
+        """
+        group = CGateGroup(network=254, application=56, group=1)
+        group.level = 200
+        mock_cgate_client._send_command = AsyncMock(
+            side_effect=CGateCommandError("C-Gate error 408: Operation failed.", code=408)
+        )
+        level = asyncio.get_event_loop().run_until_complete(
+            mock_cgate_client.get_level(group)
+        )
+        assert level == 200
+        assert group.level == 200
+        assert group.is_virtual is False
 
     def test_get_level_virtual_group_skips_command(
         self, mock_cgate_client: CGateClient
@@ -718,3 +743,52 @@ class TestGetLevel:
         )
         assert level == 0
         mock_cgate_client._send_command.assert_not_called()
+
+
+class TestCommandPortEOF:
+    """Tests for the command port being closed under an in-flight command."""
+
+    async def test_eof_ends_the_command_and_wakes_the_supervisor(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """EOF must end the read, not fall through to the blank-line skip.
+
+        readline() returns b"" at EOF and goes on doing so, so skipping it as a
+        blank line spins the loop until the supervisor's teardown nulls the
+        reader -- and the next iteration then raises AttributeError rather than
+        anything a caller is prepared for.
+        """
+        reader = MagicMock()
+        reader.readline = AsyncMock(return_value=b"")
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        mock_cgate_client._cmd_reader = reader
+        mock_cgate_client._cmd_writer = writer
+
+        with pytest.raises(CGateConnectionError):
+            await asyncio.wait_for(
+                mock_cgate_client._send_receive("NOOP"), timeout=5
+            )
+
+        # One read, not a spin.
+        assert reader.readline.await_count == 1
+        assert mock_cgate_client.connected is False
+        assert mock_cgate_client._reconnect_event.is_set()
+
+    async def test_command_error_carries_its_code(
+        self, mock_cgate_client: CGateClient
+    ) -> None:
+        """The response code is what separates 401 from a transient 4xx."""
+        reader = MagicMock()
+        reader.readline = AsyncMock(
+            return_value=b"401 Bad object or device ID.\r\n"
+        )
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        mock_cgate_client._cmd_reader = reader
+        mock_cgate_client._cmd_writer = writer
+
+        with pytest.raises(CGateCommandError) as excinfo:
+            await mock_cgate_client._send_receive("GET 254/56/1 level")
+
+        assert excinfo.value.code == 401
