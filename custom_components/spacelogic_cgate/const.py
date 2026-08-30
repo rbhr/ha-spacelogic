@@ -24,6 +24,9 @@ CONF_PROJECT_NAME = "project_name"
 RESPONSE_OK = 200
 RESPONSE_SERVICE_READY = 201
 RESPONSE_OBJECT_INFO = 300
+# "Bad object or device ID" -- what a group with no physical unit answers to
+# GET level. Permanent for that group, unlike every other error code.
+RESPONSE_NO_SUCH_OBJECT = 401
 
 # C-Gate keepalive
 DEFAULT_KEEPALIVE_INTERVAL = 60  # seconds

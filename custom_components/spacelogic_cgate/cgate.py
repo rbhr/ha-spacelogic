@@ -21,6 +21,7 @@ from .const import (
     MEASUREMENT_SCAN_MAX_DEVICE,
     RECONNECT_DELAY,
     RECONNECT_DELAY_MAX,
+    RESPONSE_NO_SUCH_OBJECT,
     RESPONSE_SERVICE_READY,
 )
 
@@ -81,6 +82,16 @@ class CGateConnectionError(Exception):
 
 class CGateCommandError(Exception):
     """Raised when a C-Gate command fails."""
+
+    def __init__(self, message: str, code: int | None = None) -> None:
+        """Keep the C-Gate response code alongside the message.
+
+        The code is what separates a permanent failure from a transient one:
+        401 means the object does not exist and never will, while a 408 from a
+        C-Gate still syncing its networks clears on its own.
+        """
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass
@@ -566,6 +577,17 @@ class CGateClient:
                 raise CGateConnectionError(
                     f"No response to {command!r} from C-Gate"
                 ) from err
+
+            if not line:
+                # readline() returns b"" at EOF and goes on doing so. Falling
+                # through to the blank-line skip below spins this loop as fast
+                # as the event loop allows until the supervisor's teardown nulls
+                # the reader out from under it -- at which point the next
+                # iteration raises AttributeError rather than anything a caller
+                # is prepared for.
+                self._mark_disconnected("command port closed by C-Gate")
+                raise CGateConnectionError("C-Gate closed the command connection")
+
             text = line.decode("ascii", errors="replace").strip()
             if not text:
                 continue
@@ -578,7 +600,7 @@ class CGateClient:
                 code = int(match.group(1))
                 if code >= 400:
                     raise CGateCommandError(
-                        f"C-Gate error {code}: {match.group(2)}"
+                        f"C-Gate error {code}: {match.group(2)}", code=code
                     )
                 return response_lines
 
@@ -627,11 +649,23 @@ class CGateClient:
             # must not be latched as virtual -- doing so would silently and
             # permanently kill a real light after one reconnect race.
             return group.level
-        except CGateCommandError:
+        except CGateCommandError as err:
+            if err.code != RESPONSE_NO_SUCH_OBJECT:
+                # Only 401 means "no physical unit", which is a permanent
+                # property of the group. Every other code is a fault in the
+                # exchange -- C-Gate answers 408 for the first minute after
+                # start, while it syncs its networks -- and latching on one of
+                # those retires a real light for the life of the process. The
+                # level is left alone for the same reason: a failed read says
+                # nothing about it, and reporting 0 switches the entity off.
+                _LOGGER.debug(
+                    "GET level failed for group %s: %s", group.address, err
+                )
+                return group.level
             group.level = 0
             group.is_virtual = True
             _LOGGER.debug(
-                "Group %s returned error on GET level; marking as virtual",
+                "Group %s has no physical unit; marking as virtual",
                 group.address,
             )
             return group.level
