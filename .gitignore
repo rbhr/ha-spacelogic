@@ -15,6 +15,5 @@ venv/
 htmlcov/
 .coverage
 *.log
-CLAUDE.md
 plan.md
 .DS_Store

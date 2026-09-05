@@ -136,6 +136,8 @@ replayed. Unloading the integration stops recovery and closes its connections.
 
 Contributions are welcome! Please open an [issue](https://github.com/rbhr/ha-spacelogic/issues) or submit a pull request.
 
+Development instructions are in [AGENTS.md](AGENTS.md). The maintained [project status](docs/PROJECT_STATUS.md) records the audit findings, implementation decisions, beta releases, and remaining validation work.
+
 ## License
 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
