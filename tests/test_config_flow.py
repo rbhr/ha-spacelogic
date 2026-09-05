@@ -207,3 +207,28 @@ class TestReconfigureErrors:
             _run(flow.async_step_reconfigure(NEW_DATA))
 
         assert err.value.reason == "already_configured"
+
+
+@pytest.mark.parametrize("step", ["user", "reconfigure"])
+@pytest.mark.parametrize("error", [CGateConnectionError("down"), asyncio.CancelledError()])
+async def test_failed_connection_test_always_disconnects(step, error):
+    flow = _make_flow(_make_entry())
+    flow._async_abort_entries_match = MagicMock()
+    with _patch_client(connect=error) as constructor:
+        if isinstance(error, asyncio.CancelledError):
+            with pytest.raises(asyncio.CancelledError):
+                await getattr(flow, f"async_step_{step}")(NEW_DATA)
+        else:
+            await getattr(flow, f"async_step_{step}")(NEW_DATA)
+        constructor.return_value.disconnect.assert_awaited_once()
+
+
+async def test_discovery_failure_disconnects_successful_test_connection():
+    flow = _make_flow(_make_entry())
+    flow._async_abort_entries_match = MagicMock()
+    with _patch_client() as constructor:
+        constructor.return_value.discover_lighting_groups = AsyncMock(
+            side_effect=CGateConnectionError("lost during discovery")
+        )
+        await flow.async_step_user(NEW_DATA)
+        constructor.return_value.disconnect.assert_awaited_once()

@@ -107,6 +107,19 @@ The integration opens three TCP connections to C-Gate:
 
 On startup, it requests the project database XML (`DBGETXML`) to discover all configured lighting groups and their metadata (name, tag/area). It then registers for status-change events to receive real-time updates whenever a C-Bus group level changes on the network.
 
+### Connection recovery
+
+If C-Gate is unavailable at startup, Home Assistant retries setup. During an
+outage, entities become unavailable and the integration attempts to reconnect
+immediately. Failed attempts back off from 15 seconds, doubling with up to 20%
+positive jitter and a maximum wait of 120 seconds.
+
+After reconnecting, known nonvirtual group levels are refreshed and measurement
+polling resumes. Failed group reads preserve the previous value. Commands that
+fail or are cancelled after transmission invalidate the connection so their late
+replies cannot be assigned to another command; commands are not automatically
+replayed. Unloading the integration stops recovery and closes its connections.
+
 ## Contributing
 
 Contributions are welcome! Please open an [issue](https://github.com/rbhr/ha-spacelogic/issues) or submit a pull request.

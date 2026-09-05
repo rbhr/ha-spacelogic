@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import re
 import socket
 import time
@@ -74,6 +75,7 @@ IGNORED_TAG_NAMES = frozenset({"<unused>", "unused", "untitled", ""})
 # DBGETXML can return large XML payloads (hundreds of KB) that exceed
 # asyncio's default 64KB line limit.
 CMD_BUFFER_LIMIT = 1024 * 1024  # 1 MB
+SOCKET_CLOSE_TIMEOUT = 5
 
 
 class CGateConnectionError(Exception):
@@ -301,6 +303,8 @@ class CGateClient:
         default_factory=asyncio.Event, repr=False
     )
     _closing: bool = field(default=False, repr=False)
+    _disconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _cleanup_task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
     def connected(self) -> bool:
@@ -341,7 +345,7 @@ class CGateClient:
 
     def _notify_connection(self, connected: bool) -> None:
         """Tell subscribers the connection state changed."""
-        for callback in self._connection_callbacks:
+        for callback in tuple(self._connection_callbacks):
             try:
                 callback(connected)
             except Exception:  # noqa: BLE001 - a bad subscriber must not stop the rest
@@ -357,6 +361,11 @@ class CGateClient:
         """
         if self._closing:
             return
+        # Close immediately, before a failed exchange releases the command lock.
+        # Keep the reference so teardown can still await wait_closed().
+        if self._cmd_writer is not None:
+            with contextlib.suppress(OSError):
+                self._cmd_writer.close()
         if self._connected:
             _LOGGER.warning("C-Gate connection lost: %s", reason)
             self._connected = False
@@ -383,6 +392,19 @@ class CGateClient:
 
     async def _connect_once(self) -> None:
         """Open all three sockets and start the listeners. Raises on failure."""
+        # A user command must never run between PROJECT USE and PROJECT START,
+        # or continue reading through a replacement of the command socket.
+        try:
+            async with self._cmd_lock:
+                await self._open_session()
+        except BaseException:
+            # Includes cancellation and errors such as an invalid greeting.
+            await self._close_sockets_and_listeners()
+            raise
+
+    async def _open_session(self) -> None:
+        """Open a session while holding the command lock."""
+        self._reconnect_event.clear()
         try:
             # Connect command port (large buffer for DBGETXML responses)
             cmd_reader, cmd_writer = await asyncio.wait_for(
@@ -415,33 +437,36 @@ class CGateClient:
             )
             _LOGGER.debug("C-Gate event port connected")
 
-            self._connected = True
             self._apply_tcp_keepalive()
 
             # Set up project
-            await self._send_command(f"PROJECT USE {self.project_name}")
-            await self._send_command(f"PROJECT START {self.project_name}")
+            await self._send_receive(f"PROJECT USE {self.project_name}", handshake=True)
+            await self._send_receive(f"PROJECT START {self.project_name}", handshake=True)
 
             # Enable events on command session for inline monitoring
-            await self._send_command("EVENT e5s1c1")
+            await self._send_receive("EVENT e5s1c1", handshake=True)
 
             # Start background listeners
+            self._connected = True
             self._scp_task = asyncio.create_task(self._scp_listener())
             self._event_task = asyncio.create_task(self._event_listener())
             self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            for task in (self._scp_task, self._event_task, self._keepalive_task):
+                task.add_done_callback(self._listener_finished)
 
-            self._reconnect_event.clear()
             self._notify_connection(True)
 
         except (TimeoutError, OSError, CGateCommandError) as err:
-            # CGateCommandError matters here: PROJECT USE / PROJECT START run
-            # after all three sockets are open, and C-Gate answers 401 when the
-            # project is missing. Without it in this tuple the exception escapes
-            # past disconnect() and leaks all three sockets on every attempt.
-            await self._close_sockets_and_listeners()
             raise CGateConnectionError(
                 f"Failed to connect to C-Gate at {self.host}:{self.command_port}"
             ) from err
+
+    def _listener_finished(self, task: asyncio.Task[None]) -> None:
+        """Unexpected listener failures must also wake the supervisor."""
+        if task not in (self._scp_task, self._event_task, self._keepalive_task):
+            return
+        if not task.cancelled() and (error := task.exception()) is not None:
+            self._mark_disconnected(f"background listener failed: {error}")
 
     def _apply_tcp_keepalive(self) -> None:
         """Enable TCP keepalive so a silently dead socket is noticed.
@@ -490,55 +515,73 @@ class CGateClient:
                     await self._connect_once()
                 except (CGateConnectionError, TimeoutError, OSError) as err:
                     attempt += 1
+                    wait = min(delay * random.uniform(1, 1.2), RECONNECT_DELAY_MAX)
                     log = _LOGGER.warning if attempt == 1 else _LOGGER.debug
                     log(
-                        "C-Gate reconnect attempt %d failed (%s); retrying in %ds",
+                        "C-Gate reconnect attempt %d failed (%s); retrying in %.1fs",
                         attempt,
                         err,
-                        delay,
+                        wait,
                     )
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(wait)
                     delay = min(delay * 2, RECONNECT_DELAY_MAX)
                 else:
                     _LOGGER.info(
                         "C-Gate reconnected to %s:%s", self.host, self.command_port
                     )
+                    await self._resync_state()
                     break
+
+    async def _resync_state(self) -> None:
+        """Recover group changes missed while the status socket was down."""
+        for group in list(self._groups.values()):
+            if not self._connected:
+                return
+            level = await self.try_get_level(group)
+            if level is not None:
+                group.level = level
+                self._notify_status(group)
 
     async def disconnect(self) -> None:
         """Disconnect for good and stop the reconnect supervisor."""
-        self._closing = True
-        self._reconnect_event.set()
-        if self._supervisor_task is not None:
-            self._supervisor_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._supervisor_task
-            self._supervisor_task = None
-        await self._close_sockets_and_listeners()
+        async with self._disconnect_lock:
+            self._closing = True
+            self._connected = False
+            self._reconnect_event.set()
+            supervisor, self._supervisor_task = self._supervisor_task, None
+            try:
+                if supervisor is not None:
+                    supervisor.cancel()
+                    await asyncio.gather(supervisor, return_exceptions=True)
+            finally:
+                await self._close_sockets_and_listeners()
 
     async def _close_sockets_and_listeners(self) -> None:
-        """Tear down sockets and listener tasks.
+        """Finish teardown even if the supervisor is cancelled during cleanup."""
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._teardown())
+        task = self._cleanup_task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done() and self._cleanup_task is task:
+                self._cleanup_task = None
 
-        Deliberately does not touch _supervisor_task: the supervisor calls this
-        while reconnecting, and cancelling itself mid-teardown would kill the
-        reconnect loop permanently.
-        """
+    async def _teardown(self) -> None:
+        """Detach and close every resource, regardless of listener exceptions."""
         self._connected = False
-
-        for task in (self._keepalive_task, self._scp_task, self._event_task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        tasks = [
+            task for task in (self._keepalive_task, self._scp_task, self._event_task)
+            if task is not None
+        ]
+        writers = [
+            writer for writer in (self._cmd_writer, self._scp_writer, self._event_writer)
+            if writer is not None
+        ]
         self._keepalive_task = None
         self._scp_task = None
         self._event_task = None
 
-        for writer in (self._cmd_writer, self._scp_writer, self._event_writer):
-            if writer is not None:
-                writer.close()
-                with contextlib.suppress(OSError):
-                    await writer.wait_closed()
         self._cmd_writer = None
         self._scp_writer = None
         self._event_writer = None
@@ -546,68 +589,80 @@ class CGateClient:
         self._scp_reader = None
         self._event_reader = None
 
+        for task in tasks:
+            task.cancel()
+        for writer in writers:
+            with contextlib.suppress(OSError):
+                writer.close()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                _LOGGER.warning("C-Gate listener failed during teardown: %s", result)
+
+        async def wait_closed(writer: asyncio.StreamWriter) -> None:
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=SOCKET_CLOSE_TIMEOUT)
+            except TimeoutError:
+                # close() flushes buffered writes first. A peer that never reads
+                # can otherwise keep the transport alive after our timeout.
+                writer.transport.abort()
+            except OSError:
+                pass
+
+        await asyncio.gather(*(wait_closed(writer) for writer in writers))
+
         _LOGGER.debug("C-Gate client disconnected")
 
-    async def _send_receive(self, command: str) -> list[str]:
+    async def _send_receive(self, command: str, *, handshake: bool = False) -> list[str]:
         """Send a command and return all response lines.
 
         Must be called with _cmd_lock held.
         Raises CGateCommandError on failure responses (4xx, 5xx).
         """
-        if not self._cmd_writer or not self._cmd_reader:
+        reader, writer = self._cmd_reader, self._cmd_writer
+        if reader is None or writer is None or self._closing or (
+            not self._connected and not handshake
+        ):
             raise CGateConnectionError("Not connected to C-Gate")
 
         _LOGGER.debug("C-Gate TX: %s", command)
-        self._cmd_writer.write(f"{command}\r\n".encode("ascii"))
-        await self._cmd_writer.drain()
-
-        response_lines: list[str] = []
-        while True:
-            try:
-                line = await asyncio.wait_for(
-                    self._cmd_reader.readline(), timeout=30
-                )
-            except (TimeoutError, OSError) as err:
-                # Do NOT let this escape with the reader mid-stream. The lock is
-                # released on the way out, so the next command would write and
-                # then read *this* command's late reply -- silently returning one
-                # channel's value for another. Kill the socket instead and let
-                # the supervisor rebuild it.
-                self._mark_disconnected(f"command port read failed: {err}")
-                raise CGateConnectionError(
-                    f"No response to {command!r} from C-Gate"
-                ) from err
-
-            if not line:
-                # readline() returns b"" at EOF and goes on doing so. Falling
-                # through to the blank-line skip below spins this loop as fast
-                # as the event loop allows until the supervisor's teardown nulls
-                # the reader out from under it -- at which point the next
-                # iteration raises AttributeError rather than anything a caller
-                # is prepared for.
-                self._mark_disconnected("command port closed by C-Gate")
-                raise CGateConnectionError("C-Gate closed the command connection")
-
-            text = line.decode("ascii", errors="replace").strip()
-            if not text:
-                continue
-
-            _LOGGER.debug("C-Gate RX: %s", text)
-            response_lines.append(text)
-
-            match = RESPONSE_PATTERN.match(text)
-            if match and text[3:4] != "-":
-                code = int(match.group(1))
-                if code >= 400:
-                    raise CGateCommandError(
-                        f"C-Gate error {code}: {match.group(2)}", code=code
-                    )
-                return response_lines
-
-        return response_lines
+        payload = f"{command}\r\n".encode("ascii")
+        try:
+            writer.write(payload)
+            await asyncio.wait_for(writer.drain(), timeout=30)
+            response_lines: list[str] = []
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=30)
+                if writer is not self._cmd_writer or (not self._connected and not handshake):
+                    raise CGateConnectionError("C-Gate session ended during command")
+                if not line:
+                    raise CGateConnectionError("C-Gate closed the command connection")
+                text = line.decode("ascii", errors="replace").strip()
+                if not text:
+                    continue
+                _LOGGER.debug("C-Gate RX: %s", text)
+                response_lines.append(text)
+                match = RESPONSE_PATTERN.match(text)
+                if match and text[3:4] != "-":
+                    code = int(match.group(1))
+                    if code >= 400:
+                        raise CGateCommandError(
+                            f"C-Gate error {code}: {match.group(2)}", code=code
+                        )
+                    return response_lines
+        except asyncio.CancelledError:
+            if writer is self._cmd_writer:
+                self._mark_disconnected("command cancelled after transmission")
+            raise
+        except (TimeoutError, OSError, ValueError, CGateConnectionError) as err:
+            if writer is self._cmd_writer:
+                self._mark_disconnected(f"command exchange failed: {err}")
+            raise CGateConnectionError(f"C-Gate command {command!r} failed") from err
 
     async def _send_command(self, command: str) -> str:
         """Send a command and return the final response line."""
+        if not self._connected or self._closing:
+            raise CGateConnectionError("Not connected to C-Gate")
         async with self._cmd_lock:
             lines = await self._send_receive(command)
             return lines[-1] if lines else ""
@@ -632,46 +687,37 @@ class CGateClient:
         await self._send_command(cmd)
         group.level = level
 
-    async def get_level(self, group: CGateGroup) -> int:
-        """Get the current level of a C-Bus group.
-
-        Virtual groups (no physical unit) return a 401 error from C-Gate.
-        When this happens, the group is marked as virtual so future polls
-        skip the command entirely.
-        """
+    async def try_get_level(self, group: CGateGroup) -> int | None:
+        """Read a level without mistaking a failed read for a successful zero."""
         if group.is_virtual:
-            group.level = 0
-            return 0
+            return None
         try:
             response = await self._send_command(f"GET {group.address} level")
         except CGateConnectionError:
-            # The link died mid-poll. This says nothing about the group, so it
-            # must not be latched as virtual -- doing so would silently and
-            # permanently kill a real light after one reconnect race.
-            return group.level
+            return None
         except CGateCommandError as err:
-            if err.code != RESPONSE_NO_SUCH_OBJECT:
-                # Only 401 means "no physical unit", which is a permanent
-                # property of the group. Every other code is a fault in the
-                # exchange -- C-Gate answers 408 for the first minute after
-                # start, while it syncs its networks -- and latching on one of
-                # those retires a real light for the life of the process. The
-                # level is left alone for the same reason: a failed read says
-                # nothing about it, and reporting 0 switches the entity off.
-                _LOGGER.debug(
-                    "GET level failed for group %s: %s", group.address, err
-                )
-                return group.level
-            group.level = 0
-            group.is_virtual = True
-            _LOGGER.debug(
-                "Group %s has no physical unit; marking as virtual",
-                group.address,
-            )
-            return group.level
+            if err.code == RESPONSE_NO_SUCH_OBJECT:
+                group.is_virtual = True
+            _LOGGER.debug("GET level failed for group %s: %s", group.address, err)
+            return None
         match = LEVEL_RESPONSE_PATTERN.match(response)
         if match:
-            group.level = int(match.group(1))
+            address = response.split()[1].removesuffix(":")
+            if address not in (group.address, f"//{self.project_name}/{group.address}"):
+                # The stream is out of sync. Do not consume its remaining reply
+                # as the result of the next command either.
+                self._mark_disconnected("GET level response address mismatch")
+                return None
+            return int(match.group(1))
+        return None
+
+    async def get_level(self, group: CGateGroup) -> int:
+        """Update a group's level, retaining normal polling semantics."""
+        level = await self.try_get_level(group)
+        if level is not None:
+            group.level = level
+        elif group.is_virtual:
+            group.level = 0
         return group.level
 
     async def read_measurement(
@@ -850,6 +896,10 @@ class CGateClient:
                     await self._send_command("NOOP")
             except CGateCommandError:
                 _LOGGER.warning("Keepalive NOOP failed")
+            except CGateConnectionError:
+                # The exchange has already invalidated the socket and woken
+                # the supervisor. Finish normally so teardown can await us.
+                return
             except (TimeoutError, OSError) as err:
                 self._mark_disconnected(f"keepalive failed: {err}")
                 break
@@ -858,12 +908,13 @@ class CGateClient:
 
     async def _scp_listener(self) -> None:
         """Listen for status change events on the SCP port."""
-        if not self._scp_reader:
+        reader = self._scp_reader
+        if reader is None:
             return
 
         while self._connected:
             try:
-                line = await self._scp_reader.readline()
+                line = await reader.readline()
                 if not line:
                     self._mark_disconnected("SCP connection closed")
                     break
@@ -882,12 +933,13 @@ class CGateClient:
 
     async def _event_listener(self) -> None:
         """Listen for events on the event port."""
-        if not self._event_reader:
+        reader = self._event_reader
+        if reader is None:
             return
 
         while self._connected:
             try:
-                line = await self._event_reader.readline()
+                line = await reader.readline()
                 if not line:
                     self._mark_disconnected("event connection closed")
                     break
@@ -932,8 +984,11 @@ class CGateClient:
             # C-Gate SCP ramp reports level as 0-255 native C-Bus value
             group.level = int(level_str)
 
-        # Notify listeners
-        for callback in self._status_callbacks:
+        self._notify_status(group)
+
+    def _notify_status(self, group: CGateGroup) -> None:
+        """Publish pushed or resynchronized group levels."""
+        for callback in tuple(self._status_callbacks):
             try:
                 callback(group)
             except Exception:

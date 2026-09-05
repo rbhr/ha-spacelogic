@@ -47,27 +47,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: CGateConfigEntry) -> boo
         project_name=entry.data[CONF_PROJECT_NAME],
     )
 
-    try:
-        await client.connect()
-    except (CGateConnectionError, CGateCommandError) as err:
-        # Must be ConfigEntryNotReady, not a bare raise: without it HA treats
-        # setup as permanently failed and never retries, so a C-Gate that is
-        # merely slow to come up needs a manual reload. That is exactly what
-        # happened on 2026-08-26.
-        raise ConfigEntryNotReady(
-            f"Cannot connect to C-Gate at {client.host}:{client.command_port}"
-        ) from err
-
-    entry.runtime_data = client
-
-    # Seed measurement readings before the platforms load. Sensors are otherwise
-    # created only reactively from broadcasts, so after a restart they sit
-    # unknown until each channel happens to report on its own schedule.
-    await _async_seed_measurements(hass, entry, client)
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
     entry.async_on_unload(client.disconnect)
+    try:
+        try:
+            await client.connect()
+        except (CGateConnectionError, CGateCommandError) as err:
+            # Must be ConfigEntryNotReady, not a bare raise: without it HA treats
+            # setup as permanently failed and never retries, so a C-Gate that is
+            # merely slow to come up needs a manual reload. That is exactly what
+            # happened on 2026-08-26.
+            raise ConfigEntryNotReady(
+                f"Cannot connect to C-Gate at {client.host}:{client.command_port}"
+            ) from err
+
+        entry.runtime_data = client
+
+        # Seed measurement readings before the platforms load. Sensors are otherwise
+        # created only reactively from broadcasts, so after a restart they sit
+        # unknown until each channel happens to report on its own schedule.
+        await _async_seed_measurements(hass, entry, client)
+
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    except BaseException:
+        await client.disconnect()
+        raise
+
     entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
 
     return True
