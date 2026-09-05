@@ -103,7 +103,7 @@ class CGateGroup:
     network: int
     application: int
     group: int
-    level: int = 0
+    level: int | None = None
     name: str = ""
     is_virtual: bool = False
 
@@ -180,25 +180,20 @@ def _element_value(element: ET.Element, key: str) -> str | None:
     return None
 
 
-def parse_xml_groups(
-    xml_text: str, application: int = CBUS_LIGHTING_APPLICATION
-) -> list[dict[str, int | str]]:
-    """Parse C-Gate DBGETXML response XML and extract lighting groups.
-
-    Returns a list of dicts with keys: network, application, group, name.
-    The XML structure is:
-      Installation > Project > Network > Application > Group
-    where Address and TagName are child elements (not XML attributes).
-    """
+def _parse_xml_project(
+    xml_text: str, application: int, project_name: str | None = None
+) -> tuple[list[dict[str, int | str]], set[int]]:
+    """Extract groups and all network addresses, including sensor-only networks."""
     results: list[dict[str, int | str]] = []
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        _LOGGER.warning("Failed to parse C-Gate XML database")
-        return results
+    networks: set[int] = set()
+    root = ET.fromstring(xml_text)
 
     for project_el in root:
         if project_el.tag.lower() != "project":
+            continue
+        if project_name is not None and (
+            _element_value(project_el, "Address") or _element_value(project_el, "TagName")
+        ) != project_name:
             continue
         for network_el in project_el:
             if network_el.tag.lower() != "network":
@@ -210,6 +205,7 @@ def parse_xml_groups(
                 network_num = int(network_addr)
             except ValueError:
                 continue
+            networks.add(network_num)
 
             for app_el in network_el:
                 if app_el.tag.lower() != "application":
@@ -255,7 +251,18 @@ def parse_xml_groups(
                         "name": tag_name.strip(),
                     })
 
-    return results
+    return results, networks
+
+
+def parse_xml_groups(
+    xml_text: str, application: int = CBUS_LIGHTING_APPLICATION
+) -> list[dict[str, int | str]]:
+    """Parse a tag database and return its named groups for an application."""
+    try:
+        return _parse_xml_project(xml_text, application)[0]
+    except ET.ParseError:
+        _LOGGER.warning("Failed to parse C-Gate XML database")
+        return []
 
 
 @dataclass
@@ -286,6 +293,7 @@ class CGateClient:
     _event_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _connected: bool = field(default=False, repr=False)
     _groups: dict[str, CGateGroup] = field(default_factory=dict, repr=False)
+    _networks: set[int] = field(default_factory=set, repr=False)
     _status_callbacks: list[Callable[[CGateGroup], None]] = field(
         default_factory=list, repr=False
     )
@@ -711,13 +719,11 @@ class CGateClient:
             return int(match.group(1))
         return None
 
-    async def get_level(self, group: CGateGroup) -> int:
-        """Update a group's level, retaining normal polling semantics."""
+    async def get_level(self, group: CGateGroup) -> int | None:
+        """Update a level only on success, preserving unknown and virtual state."""
         level = await self.try_get_level(group)
         if level is not None:
             group.level = level
-        elif group.is_virtual:
-            group.level = 0
         return group.level
 
     async def read_measurement(
@@ -745,7 +751,9 @@ class CGateClient:
         # asynchronous lines on this same session, so a mismatched address means
         # we picked up someone else's frame and must not store it as ours.
         if (
-            int(match.group(2)) != network
+            match.group(1) != self.project_name
+            or int(match.group(2)) != network
+            or int(match.group(3)) != CBUS_MEASUREMENT_APPLICATION
             or int(match.group(4)) != device
             or int(match.group(5)) != channel
         ):
@@ -793,7 +801,7 @@ class CGateClient:
         """Probe for measurement channels. Only for a first run; bounded."""
         if not networks:
             networks = sorted(
-                {g.network for g in self._groups.values()}
+                self._networks or {g.network for g in self._groups.values()}
             ) or [DEFAULT_MEASUREMENT_NETWORK]
 
         found: list[tuple[int, int, int]] = []
@@ -822,13 +830,7 @@ class CGateClient:
         - 344: End XML snippet
         """
         async with self._cmd_lock:
-            try:
-                lines = await self._send_receive(
-                    f"DBGETXML //{self.project_name}"
-                )
-            except CGateCommandError:
-                _LOGGER.warning("DBGETXML failed for project %s", self.project_name)
-                return []
+            lines = await self._send_receive(f"DBGETXML //{self.project_name}")
 
         # Extract XML content from 347 lines.
         # Response lines use "347-content" (continuation) format.
@@ -846,14 +848,17 @@ class CGateClient:
                     xml_parts.append(content)
 
         if not xml_parts:
-            _LOGGER.warning("DBGETXML returned no XML content")
-            return []
+            raise CGateCommandError("DBGETXML returned no XML content")
 
         xml_text = "\n".join(xml_parts)
         _LOGGER.debug("DBGETXML returned %d bytes of XML", len(xml_text))
         _LOGGER.debug("DBGETXML XML start: %.500s", xml_text)
 
-        return parse_xml_groups(xml_text, application)
+        try:
+            groups, self._networks = _parse_xml_project(xml_text, application, self.project_name)
+        except ET.ParseError as err:
+            raise CGateCommandError("DBGETXML returned invalid XML") from err
+        return groups
 
     async def discover_lighting_groups(
         self, application: int = CBUS_LIGHTING_APPLICATION
@@ -877,12 +882,11 @@ class CGateClient:
 
         # Fetch current levels for discovered groups
         for group in discovered:
-            try:
-                await self.get_level(group)
-            except (CGateCommandError, CGateConnectionError):
-                _LOGGER.debug(
-                    "Could not get level for group %s", group.address
-                )
+            if not self.connected:
+                raise CGateConnectionError("Connection lost during group discovery")
+            await self.get_level(group)
+        if not self.connected:
+            raise CGateConnectionError("Connection lost during group discovery")
 
         return discovered
 
@@ -968,6 +972,8 @@ class CGateClient:
 
     def _handle_lighting_event(self, match: re.Match[str]) -> None:
         """Handle a lighting SCP event."""
+        if match.group(2) != self.project_name or int(match.group(4)) != CBUS_LIGHTING_APPLICATION:
+            return
         action = match.group(1)
         network = int(match.group(3))
         application = int(match.group(4))
@@ -999,6 +1005,11 @@ class CGateClient:
 
         SCP format: measurement data //PROJECT/NET/228/DEVICE/CHANNEL VALUE EXP UNITS #sourceunit=X
         """
+        if (
+            match.group(1) != self.project_name
+            or int(match.group(3)) != CBUS_MEASUREMENT_APPLICATION
+        ):
+            return
         self._update_measurement(
             network=int(match.group(2)),
             application=int(match.group(3)),

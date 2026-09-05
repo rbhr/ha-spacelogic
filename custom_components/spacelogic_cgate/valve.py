@@ -35,7 +35,7 @@ async def async_setup_entry(
     )
     known_groups: set[str] = set()
 
-    discovered = await client.discover_lighting_groups()
+    discovered = list(client.groups.values())
     entities = []
     for group in discovered:
         if group_overrides.get(group.unique_id, DEFAULT_GROUP_TYPE) != GROUP_TYPE_VALVE:
@@ -99,9 +99,10 @@ class CGateValve(ValveEntity):
         )
 
     @property
-    def is_closed(self) -> bool:
+    def is_closed(self) -> bool | None:
         """Return true if the valve is closed."""
-        return self._group.level == 0
+        level = self._group.level
+        return None if level is None else level == 0
 
     @property
     def available(self) -> bool:

@@ -62,6 +62,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: CGateConfigEntry) -> boo
 
         entry.runtime_data = client
 
+        # Discover and seed once for all actuator platforms. This also learns
+        # the project's networks before the first measurement-channel probe.
+        try:
+            await client.discover_lighting_groups()
+        except (CGateConnectionError, CGateCommandError) as err:
+            raise ConfigEntryNotReady("Cannot discover C-Gate groups") from err
+
         # Seed measurement readings before the platforms load. Sensors are otherwise
         # created only reactively from broadcasts, so after a restart they sit
         # unknown until each channel happens to report on its own schedule.
@@ -84,15 +91,18 @@ async def _async_seed_measurements(
     """Poll every known measurement channel once, before platforms set up."""
     from .sensor import _known_channels  # noqa: PLC0415 - avoids a circular import
 
-    channels = _known_channels(hass, entry)
-    if not channels:
+    if not _known_channels(hass, entry, include_live=False):
         # First run: nothing in the registry yet, so probe for channels.
         try:
             channels = await client.scan_measurement_channels()
         except (CGateConnectionError, CGateCommandError):
             _LOGGER.debug("Measurement channel scan failed; relying on broadcasts")
             return
+        # The probe stores each successful reading already; do not poll twice.
+        _LOGGER.debug("Seeded %d measurement channels during discovery", len(channels))
+        return
 
+    channels = _known_channels(hass, entry)
     try:
         found = await client.async_refresh_measurements(channels)
     except (CGateConnectionError, CGateCommandError):

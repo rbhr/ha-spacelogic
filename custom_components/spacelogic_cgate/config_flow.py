@@ -16,7 +16,7 @@ from homeassistant.const import CONF_HOST
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import selector
 
-from .cgate import CGateClient, CGateConnectionError, CGateGroup
+from .cgate import CGateClient, CGateCommandError, CGateConnectionError, CGateGroup
 from .const import (
     CONF_COMMAND_PORT,
     CONF_EVENT_PORT,
@@ -203,7 +203,7 @@ class CGateConfigFlow(ConfigFlow, domain=DOMAIN):
                     discovered = await client.discover_lighting_groups()
                 finally:
                     await client.disconnect()
-            except CGateConnectionError:
+            except (CGateConnectionError, CGateCommandError):
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected exception during connection test")

@@ -10,6 +10,7 @@ from homeassistant.components.light import (
     ATTR_TRANSITION,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import area_registry as ar
@@ -71,8 +72,8 @@ async def async_setup_entry(
     # Only handle groups assigned to the light platform (dimmer or relay)
     light_types = {GROUP_TYPE_DIMMER, GROUP_TYPE_RELAY}
 
-    # Discover existing groups from C-Gate via TREE + GET TagName
-    discovered = await client.discover_lighting_groups()
+    # Entry setup has already discovered and seeded the shared group cache.
+    discovered = list(client.groups.values())
     entities = []
     for group in discovered:
         group_type = group_overrides.get(group.unique_id, DEFAULT_GROUP_TYPE)
@@ -134,6 +135,9 @@ class CGateLight(LightEntity):
         self._is_relay = is_relay
         self.entity_id = f"light.sl_group_{group.group}"
 
+        self._attr_supported_features = (
+            LightEntityFeature(0) if is_relay else LightEntityFeature.TRANSITION
+        )
         if is_relay:
             self._attr_color_mode = ColorMode.ONOFF
             self._attr_supported_color_modes = {ColorMode.ONOFF}
@@ -154,9 +158,10 @@ class CGateLight(LightEntity):
         )
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if the light is on."""
-        return self._group.level > 0
+        level = self._group.level
+        return None if level is None else level > 0
 
     @property
     def brightness(self) -> int | None:
@@ -178,7 +183,7 @@ class CGateLight(LightEntity):
             brightness = kwargs.get(ATTR_BRIGHTNESS, CBUS_LEVEL_MAX)
             transition = kwargs.get(ATTR_TRANSITION)
 
-            if transition is not None:
+            if transition is not None and not self._is_relay:
                 await self._client.ramp(
                     self._group, brightness, transition=int(transition)
                 )
@@ -192,7 +197,7 @@ class CGateLight(LightEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the light."""
         transition = kwargs.get(ATTR_TRANSITION)
-        if transition is not None:
+        if transition is not None and not self._is_relay:
             await self._client.ramp(
                 self._group, 0, transition=int(transition)
             )

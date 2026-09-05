@@ -35,7 +35,7 @@ async def async_setup_entry(
     )
     known_groups: set[str] = set()
 
-    discovered = await client.discover_lighting_groups()
+    discovered = list(client.groups.values())
     entities = []
     for group in discovered:
         if group_overrides.get(group.unique_id, DEFAULT_GROUP_TYPE) != GROUP_TYPE_LOCK:
@@ -95,9 +95,10 @@ class CGateLock(LockEntity):
         )
 
     @property
-    def is_locked(self) -> bool:
+    def is_locked(self) -> bool | None:
         """Return true if the lock is locked (level == 0)."""
-        return self._group.level == 0
+        level = self._group.level
+        return None if level is None else level == 0
 
     @property
     def available(self) -> bool:

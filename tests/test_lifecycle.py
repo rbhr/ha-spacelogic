@@ -62,13 +62,14 @@ async def test_real_entities_publish_outages_resync_and_unsubscribe(hass, mock_c
         patch.object(client, "connect", AsyncMock()),
         patch.object(client, "discover_lighting_groups", AsyncMock(
             return_value=list(client.groups.values())
-        )),
+        )) as discover,
         patch.object(client, "_send_command", AsyncMock(side_effect=reply)),
         patch.object(client, "async_refresh_measurements",
                      wraps=client.async_refresh_measurements) as refresh,
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
+        discover.assert_awaited_once()
         entity_ids = [f"{domain}.sl_group_{number}" for number, domain in enumerate(domains, 1)]
         for entity_id in entity_ids:
             assert hass.states.get(entity_id) is not None
@@ -104,6 +105,7 @@ async def test_interrupted_entry_setup_disconnects(hass, mock_config_data, stage
         patch.object(integration, "CGateClient", return_value=client),
         patch.object(client, "connect", AsyncMock()),
         patch.object(client, "disconnect", wraps=client.disconnect) as disconnect,
+        patch.object(client, "discover_lighting_groups", AsyncMock(return_value=[])),
         patch.object(integration, "_async_seed_measurements", AsyncMock(
             side_effect=error if stage == "seed" else None
         )),
@@ -128,6 +130,7 @@ async def test_unreachable_at_boot_requests_ha_retry(hass, mock_config_data):
         patch.object(integration, "CGateClient", return_value=client),
         patch.object(client, "connect", AsyncMock(side_effect=CGateConnectionError("down"))),
         patch.object(client, "disconnect", wraps=client.disconnect) as disconnect,
+        patch.object(client, "discover_lighting_groups", AsyncMock(return_value=[])),
     ):
         with pytest.raises(ConfigEntryNotReady):
             await integration.async_setup_entry(hass, entry)

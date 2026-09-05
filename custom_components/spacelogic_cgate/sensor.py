@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from . import CGateConfigEntry
 from .cgate import CGateClient, CGateConnectionError, CGateMeasurement
 from .const import (
+    CBUS_MEASUREMENT_APPLICATION,
     DEFAULT_MEASUREMENT_SCAN_INTERVAL,
     DEFAULT_MEASUREMENT_STALE_AFTER,
     DOMAIN,
@@ -156,14 +158,18 @@ async def async_setup_entry(
     # serialises behind the client's single _cmd_lock, and ~150 group polls
     # already run on HA's 30s cycle; 14 concurrent measurement pollers would
     # queue ahead of user-initiated commands such as a light switch press.
-    channels = _known_channels(hass, entry)
+    poll_lock = asyncio.Lock()
 
     async def _poll(_now: datetime | None = None) -> None:
-        if not client.connected or not channels:
+        if not client.connected or poll_lock.locked():
             return
-        # The supervisor is already rebuilding the link; nothing to do here.
-        with contextlib.suppress(CGateConnectionError):
-            await client.async_refresh_measurements(channels)
+        async with poll_lock:
+            # Include channels discovered since setup, even if their entity
+            # registry entry has not been created yet.
+            channels = _known_channels(hass, entry)
+            if channels:
+                with contextlib.suppress(CGateConnectionError):
+                    await client.async_refresh_measurements(channels)
 
     entry.async_on_unload(
         async_track_time_interval(
@@ -183,16 +189,21 @@ async def async_setup_entry(
 
 
 def _known_channels(
-    hass: HomeAssistant, entry: CGateConfigEntry
+    hass: HomeAssistant, entry: CGateConfigEntry, *, include_live: bool = True
 ) -> list[tuple[int, int, int]]:
-    """Rebuild the channel list from the entity registry.
+    """Combine persistent channels with readings discovered during this session.
 
     The registry already persists exactly which channels exist, so this needs no
     extra storage and no probe on a normal start. Note the integration's own
     DBGETXML-based discovery cannot help here: it walks a four-level tree, while
     a measurement channel is five levels deep.
     """
-    channels: list[tuple[int, int, int]] = []
+    client: CGateClient | None = getattr(entry, "runtime_data", None)
+    channels: set[tuple[int, int, int]] = {
+        (meas.network, meas.device, meas.channel)
+        for meas in client.measurements.values()
+        if meas.application == CBUS_MEASUREMENT_APPLICATION
+    } if client and include_live else set()
     prefix = f"{entry.entry_id}_meas_"
     for reg_entry in er.async_entries_for_config_entry(
         er.async_get(hass), entry.entry_id
@@ -203,11 +214,12 @@ def _known_channels(
         if len(parts) != 4:
             continue
         try:
-            network, _app, device, channel = (int(p) for p in parts)
+            network, application, device, channel = (int(p) for p in parts)
         except ValueError:
             continue
-        channels.append((network, device, channel))
-    return channels
+        if application == CBUS_MEASUREMENT_APPLICATION:
+            channels.add((network, device, channel))
+    return sorted(channels)
 
 
 class CGateMeasurementSensor(SensorEntity):
