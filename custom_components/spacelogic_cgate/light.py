@@ -206,10 +206,18 @@ class CGateLight(LightEntity):
         if group.unique_id == self._group.unique_id:
             self.async_write_ha_state()
 
+    @callback
+    def _handle_connection_change(self, connected: bool) -> None:
+        """Publish availability immediately when the connection changes."""
+        self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         """Register for status updates when entity is added."""
         self.async_on_remove(
             self._client.register_status_callback(self._handle_group_update)
+        )
+        self.async_on_remove(
+            self._client.register_connection_callback(self._handle_connection_change)
         )
 
     async def async_update(self) -> None:

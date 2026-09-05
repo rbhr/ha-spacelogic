@@ -198,15 +198,17 @@ class CGateConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
             try:
-                await client.connect()
-                discovered = await client.discover_lighting_groups()
+                try:
+                    await client.connect()
+                    discovered = await client.discover_lighting_groups()
+                finally:
+                    await client.disconnect()
             except CGateConnectionError:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected exception during connection test")
                 errors["base"] = "unknown"
             else:
-                await client.disconnect()
                 self._user_input = user_input
                 self._discovered_groups = {
                     g.unique_id: g for g in discovered
@@ -261,14 +263,16 @@ class CGateConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
             try:
-                await client.connect()
+                try:
+                    await client.connect()
+                finally:
+                    await client.disconnect()
             except CGateConnectionError:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected exception during connection test")
                 errors["base"] = "unknown"
             else:
-                await client.disconnect()
                 return self._apply_reconfigure(entry, user_input)
 
         return self.async_show_form(
