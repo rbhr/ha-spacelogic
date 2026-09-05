@@ -42,7 +42,7 @@ async def async_setup_entry(
     )
     known_groups: set[str] = set()
 
-    discovered = await client.discover_lighting_groups()
+    discovered = list(client.groups.values())
     entities = []
     for group in discovered:
         if group_overrides.get(group.unique_id, DEFAULT_GROUP_TYPE) != GROUP_TYPE_FAN:
@@ -72,7 +72,9 @@ class CGateFan(FanEntity):
     """Representation of a C-Bus group as a fan."""
 
     _attr_has_entity_name = False
-    _attr_supported_features = FanEntityFeature.SET_SPEED
+    _attr_supported_features = (
+        FanEntityFeature.SET_SPEED | FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF
+    )
 
     def __init__(
         self,
@@ -103,16 +105,16 @@ class CGateFan(FanEntity):
         )
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if the fan is on."""
-        return self._group.level > 0
+        level = self._group.level
+        return None if level is None else level > 0
 
     @property
     def percentage(self) -> int | None:
         """Return the current speed percentage (0-100)."""
-        if not self.is_on:
-            return 0
-        return round(self._group.level * 100 / CBUS_LEVEL_MAX)
+        level = self._group.level
+        return None if level is None else round(level * 100 / CBUS_LEVEL_MAX)
 
     @property
     def available(self) -> bool:

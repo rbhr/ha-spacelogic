@@ -35,7 +35,7 @@ async def async_setup_entry(
     )
     known_groups: set[str] = set()
 
-    discovered = await client.discover_lighting_groups()
+    discovered = list(client.groups.values())
     entities = []
     for group in discovered:
         if group_overrides.get(group.unique_id, DEFAULT_GROUP_TYPE) != GROUP_TYPE_SWITCH:
@@ -96,9 +96,10 @@ class CGateSwitch(SwitchEntity):
         )
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
         """Return true if the switch is on."""
-        return self._group.level > 0
+        level = self._group.level
+        return None if level is None else level > 0
 
     @property
     def available(self) -> bool:

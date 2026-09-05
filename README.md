@@ -107,6 +107,18 @@ The integration opens three TCP connections to C-Gate:
 
 On startup, it requests the project database XML (`DBGETXML`) to discover all configured lighting groups and their metadata (name, tag/area). It then registers for status-change events to receive real-time updates whenever a C-Bus group level changes on the network.
 
+Discovery runs once per integration setup and shares the results across all
+entity platforms. The project database also supplies network addresses for the
+initial measurement probe, including networks that have no lighting groups.
+New measurement channels discovered through events join subsequent polling
+cycles automatically. Incoming events and measurement replies must match the
+configured project and the supported application.
+
+A group's state stays **unknown** until a successful read, event, or command
+establishes its level. A failed read never implies that a light is off or a lock
+is locked. Virtual groups skip level polling and retain the state established
+by events or successful commands.
+
 ### Connection recovery
 
 If C-Gate is unavailable at startup, Home Assistant retries setup. During an

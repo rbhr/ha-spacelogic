@@ -35,9 +35,9 @@ class TestCGateGroup:
         group = CGateGroup(network=254, application=56, group=1)
         assert group.unique_id == "254_56_1"
 
-    def test_default_level(self) -> None:
+    def test_default_level_is_unknown(self) -> None:
         group = CGateGroup(network=254, application=56, group=1)
-        assert group.level == 0
+        assert group.level is None
 
 
 class TestSCPPattern:
@@ -421,7 +421,7 @@ class TestCGateClientSCPHandler:
 
     def test_handle_on_event(self, mock_cgate_client: CGateClient) -> None:
         mock_cgate_client._handle_scp_event(
-            "lighting on //HOME/254/56/1 #sourceunit=12"
+            "lighting on //TEST_PROJECT/254/56/1 #sourceunit=12"
         )
         group = mock_cgate_client.groups.get("254_56_1")
         assert group is not None
@@ -429,10 +429,10 @@ class TestCGateClientSCPHandler:
 
     def test_handle_off_event(self, mock_cgate_client: CGateClient) -> None:
         mock_cgate_client._handle_scp_event(
-            "lighting on //HOME/254/56/1 #sourceunit=12"
+            "lighting on //TEST_PROJECT/254/56/1 #sourceunit=12"
         )
         mock_cgate_client._handle_scp_event(
-            "lighting off //HOME/254/56/1 #sourceunit=12"
+            "lighting off //TEST_PROJECT/254/56/1 #sourceunit=12"
         )
         group = mock_cgate_client.groups["254_56_1"]
         assert group.level == 0
@@ -442,7 +442,7 @@ class TestCGateClientSCPHandler:
     ) -> None:
         """SCP ramp level is native 0-255 and should be stored directly."""
         mock_cgate_client._handle_scp_event(
-            "lighting ramp //HOME/254/56/5 128 #sourceunit=4"
+            "lighting ramp //TEST_PROJECT/254/56/5 128 #sourceunit=4"
         )
         group = mock_cgate_client.groups["254_56_5"]
         assert group.level == 128
@@ -451,7 +451,7 @@ class TestCGateClientSCPHandler:
         self, mock_cgate_client: CGateClient
     ) -> None:
         mock_cgate_client._handle_scp_event(
-            "lighting ramp //HOME/254/56/5 255 #sourceunit=4"
+            "lighting ramp //TEST_PROJECT/254/56/5 255 #sourceunit=4"
         )
         group = mock_cgate_client.groups["254_56_5"]
         assert group.level == 255
@@ -460,7 +460,7 @@ class TestCGateClientSCPHandler:
         self, mock_cgate_client: CGateClient
     ) -> None:
         mock_cgate_client._handle_scp_event(
-            "lighting ramp //HOME/254/56/5 0 #sourceunit=4"
+            "lighting ramp //TEST_PROJECT/254/56/5 0 #sourceunit=4"
         )
         group = mock_cgate_client.groups["254_56_5"]
         assert group.level == 0
@@ -472,7 +472,7 @@ class TestCGateClientSCPHandler:
         mock_cgate_client.register_status_callback(received.append)
 
         mock_cgate_client._handle_scp_event(
-            "lighting on //HOME/254/56/1 #sourceunit=12"
+            "lighting on //TEST_PROJECT/254/56/1 #sourceunit=12"
         )
         assert len(received) == 1
         assert received[0].level == 255
@@ -484,13 +484,13 @@ class TestCGateClientSCPHandler:
         unsub = mock_cgate_client.register_status_callback(received.append)
 
         mock_cgate_client._handle_scp_event(
-            "lighting on //HOME/254/56/1 #sourceunit=12"
+            "lighting on //TEST_PROJECT/254/56/1 #sourceunit=12"
         )
         assert len(received) == 1
 
         unsub()
         mock_cgate_client._handle_scp_event(
-            "lighting off //HOME/254/56/1 #sourceunit=12"
+            "lighting off //TEST_PROJECT/254/56/1 #sourceunit=12"
         )
         assert len(received) == 1  # no new callback
 
@@ -607,7 +607,7 @@ class TestMeasurementSCPHandler:
         self, mock_cgate_client: CGateClient
     ) -> None:
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/3 18500 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/3 18500 -1 38 #sourceunit=26 OID="
         )
         meas = mock_cgate_client.measurements.get("254_228_1_3")
         assert meas is not None
@@ -624,10 +624,10 @@ class TestMeasurementSCPHandler:
     ) -> None:
         """Second event for the same device/channel updates the existing object."""
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/3 18500 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/3 18500 -1 38 #sourceunit=26 OID="
         )
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/3 19000 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/3 19000 -1 38 #sourceunit=26 OID="
         )
         meas = mock_cgate_client.measurements["254_228_1_3"]
         assert meas.raw_value == 19000
@@ -640,7 +640,7 @@ class TestMeasurementSCPHandler:
         mock_cgate_client.register_measurement_callback(received.append)
 
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/0 11104 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/0 11104 -1 38 #sourceunit=26 OID="
         )
         assert len(received) == 1
         assert received[0].value == pytest.approx(1110.4)
@@ -652,13 +652,13 @@ class TestMeasurementSCPHandler:
         unsub = mock_cgate_client.register_measurement_callback(received.append)
 
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/0 11104 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/0 11104 -1 38 #sourceunit=26 OID="
         )
         assert len(received) == 1
 
         unsub()
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/0 12000 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/0 12000 -1 38 #sourceunit=26 OID="
         )
         assert len(received) == 1  # no new callback
 
@@ -666,13 +666,13 @@ class TestMeasurementSCPHandler:
         self, mock_cgate_client: CGateClient
     ) -> None:
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/0 11104 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/0 11104 -1 38 #sourceunit=26 OID="
         )
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/1/1 6131 -1 38 #sourceunit=26 OID="
+            "measurement data //TEST_PROJECT/254/228/1/1 6131 -1 38 #sourceunit=26 OID="
         )
         mock_cgate_client._handle_scp_event(
-            "measurement data //YELMAH/254/228/3/3 3050 -2 0 #sourceunit=25 OID="
+            "measurement data //TEST_PROJECT/254/228/3/3 3050 -2 0 #sourceunit=25 OID="
         )
         assert len(mock_cgate_client.measurements) == 3
         assert "254_228_1_0" in mock_cgate_client.measurements
@@ -692,12 +692,12 @@ class TestGetLevel:
         assert level == 128
         assert group.level == 128
 
-    def test_get_level_virtual_group_returns_zero(
+    def test_get_level_virtual_group_preserves_state(
         self, mock_cgate_client: CGateClient
     ) -> None:
-        """Virtual groups trigger a 401 error; get_level should default to 0."""
+        """A 401 marks a group virtual without erasing its last known level."""
         group = CGateGroup(network=254, application=56, group=234)
-        group.level = 99  # set a non-zero level to verify it gets reset
+        group.level = 99
         mock_cgate_client._send_command = AsyncMock(
             side_effect=CGateCommandError(
                 "C-Gate error 401: Bad object or device ID.", code=401
@@ -706,8 +706,8 @@ class TestGetLevel:
         level = asyncio.get_event_loop().run_until_complete(
             mock_cgate_client.get_level(group)
         )
-        assert level == 0
-        assert group.level == 0
+        assert level == 99
+        assert group.level == 99
         assert group.is_virtual is True
 
     def test_get_level_transient_error_keeps_the_group(
@@ -741,7 +741,7 @@ class TestGetLevel:
         level = asyncio.get_event_loop().run_until_complete(
             mock_cgate_client.get_level(group)
         )
-        assert level == 0
+        assert level is None
         mock_cgate_client._send_command.assert_not_called()
 
 
