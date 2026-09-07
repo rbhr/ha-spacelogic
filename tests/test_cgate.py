@@ -90,17 +90,25 @@ class TestLevelResponsePattern:
     def test_level_response(self) -> None:
         match = LEVEL_RESPONSE_PATTERN.match("300 //HOME/254/56/1: level=128")
         assert match is not None
-        assert match.group(1) == "128"
+        assert match.group(1) == "//HOME/254/56/1"
+        assert match.group(2) == "128"
 
     def test_level_zero(self) -> None:
         match = LEVEL_RESPONSE_PATTERN.match("300 //HOME/254/56/1: level=0")
         assert match is not None
-        assert match.group(1) == "0"
+        assert match.group(2) == "0"
 
     def test_level_max(self) -> None:
         match = LEVEL_RESPONSE_PATTERN.match("300 //HOME/254/56/1: level=255")
         assert match is not None
-        assert match.group(1) == "255"
+        assert match.group(2) == "255"
+
+    def test_address_excludes_trailing_colon(self) -> None:
+        """The colon is a delimiter, not part of the address it separates."""
+        match = LEVEL_RESPONSE_PATTERN.match("300 254/56/1: level=64")
+        assert match is not None
+        assert match.group(1) == "254/56/1"
+        assert match.group(2) == "64"
 
 
 # --- XML database parsing tests ---
