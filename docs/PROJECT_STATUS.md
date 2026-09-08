@@ -1,18 +1,19 @@
 # Project status and durable context
 
-Last updated: **2026-09-05**. Repository: [rbhr/ha-spacelogic](https://github.com/rbhr/ha-spacelogic).
+Last updated: **2026-09-08**. Repository: [rbhr/ha-spacelogic](https://github.com/rbhr/ha-spacelogic).
 
 This is the maintained handoff for future sessions. It preserves decisions and evidence from the project audit and implementation work; it is not a verbatim chat transcript. Verify newer commits and releases before treating this snapshot as current.
 
 ## Current state
 
-**All nine numbered audit findings have implemented fixes, merged and released across `v1.2.2b1` and `v1.2.2b2`. Physical C-Gate validation is still pending.** No results from installing these betas on the maintainer's hardware have been reported yet. This does not establish that every possible project defect is fixed.
+**All nine numbered audit findings have implemented fixes, merged and released. `v1.2.2` is now the latest stable release. Physical C-Gate validation is still pending.** No results from installing 1.2.2 on the maintainer's hardware have been reported. Stable promotion was requested by the maintainer on 2026-09-07; it records their release decision, not a hardware result, and does not establish that every possible project defect is fixed.
 
-- Latest beta: [v1.2.2b2](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2b2), package/manifest version `1.2.2b2`.
-- Beta 2 code merge: `246f409aa730ca29ad8bb707393a71a0f5182e7a`. Local and remote main matched this commit before the documentation handoff was added.
-- Latest stable: [v1.2.1](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.1). Both 1.2.2 betas are GitHub prereleases, not the latest stable release.
-- Latest recorded code validation: **183 tests passed**, Ruff passed, mypy passed, and `git diff --check` passed. GitHub Tests, HACS Validation, and Hassfest Validation passed on PR #7.
-- Next step: the maintainer tests beta 2 through HACS and reports behavior. No additional implementation from the numbered audit is waiting to be started.
+- Latest stable: [v1.2.2](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2), package/manifest version `1.2.2`. It replaced `v1.2.1` as the GitHub latest release.
+- Stable code merge: `5b57c88596279962cf8d0208cf41bf54984cbd94` (PR #8). Its tree matches the tested head `97db36cc8e3899d8b8ec7c5cf5144b839685e749`.
+- `v1.2.2` is the same code as `v1.2.2b2` plus one internal cleanup with no behavior change: `LEVEL_RESPONSE_PATTERN` captures the level reply address instead of `try_get_level` re-splitting the raw response, retiring the compensating `removesuffix(":")`.
+- Superseded prereleases: [v1.2.2b1](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2b1) and [v1.2.2b2](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2b2) remain GitHub prereleases; beta 2 merged as `246f409aa730ca29ad8bb707393a71a0f5182e7a`.
+- Latest recorded code validation: **184 tests passed**, Ruff passed, mypy passed, and `git diff --check` passed. GitHub Tests, HACS Validation, and Hassfest Validation passed on PR #8.
+- Next step: the maintainer installs `v1.2.2` through HACS and reports behavior against the checklist below. No additional implementation from the numbered audit is waiting to be started.
 
 ## Complete audit ledger
 
@@ -30,7 +31,7 @@ The initial review had nine findings despite a passing baseline of 123 tests. Th
 | 8 | Each actuator platform repeated discovery; first-run measurement probes could use the wrong network. | Discover/seed groups once before platform forwarding; retain all discovered networks, including measurement-only ones; avoid polling successful probes twice; retry setup on failed database discovery. | Beta 2, PR #7 |
 | 9 | Recovery behavior did not meet the documented resync/availability/retry semantics. | Resync known nonvirtual groups after reconnect, publish only successful reads, notify actuator availability immediately, retain sensor refresh, and apply jittered retries capped at 120 seconds. | Beta 1, PR #6 |
 
-Every row is **implemented, merged, and beta-released**. Hardware validation remains pending for the combined result; items 4–8 were not dropped or left deferred.
+Every row is **implemented, merged, and released** — through the two betas and now in stable `v1.2.2`. Hardware validation remains pending for the combined result; items 4–8 were not dropped or left deferred.
 
 ## Release evidence
 
@@ -38,8 +39,9 @@ Every row is **implemented, merged, and beta-released**. Hardware validation rem
 | --- | --- | --- | --- | --- | --- |
 | [v1.2.2b1](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2b1) | 1–3 and 9 | [#6](https://github.com/rbhr/ha-spacelogic/pull/6), `fix/cgate-recovery-beta` | `d43450f5ba96f8b71f5be0d7112905bb8a1e1384` | `4929e30e643e26272a31e7e6683e09b9fd9f1d28` | 163 tests (40 added); Ruff, mypy, diff check and all three CI checks passed. |
 | [v1.2.2b2](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2b2) | 4–8, retaining beta 1 | [#7](https://github.com/rbhr/ha-spacelogic/pull/7), `fix/cgate-state-and-discovery` | `3f5d61134193149fe360a97f20ba7119f3b612ba` | `246f409aa730ca29ad8bb707393a71a0f5182e7a` | 183 tests (20 added); Ruff, mypy, diff check and all three CI checks passed. |
+| [v1.2.2](https://github.com/rbhr/ha-spacelogic/releases/tag/v1.2.2) | Stable promotion of 1–9, plus the level-pattern cleanup | [#8](https://github.com/rbhr/ha-spacelogic/pull/8), `release/1.2.2` | `97db36cc8e3899d8b8ec7c5cf5144b839685e749` | `5b57c88596279962cf8d0208cf41bf54984cbd94` | 184 tests (1 added); Ruff, mypy, diff check and all three CI checks passed. |
 
-Beta 1 merged at 20:22:07 UTC and was published at 20:22:38 UTC on 2026-09-05. Beta 2 merged at 20:53:48 UTC and was published at 20:54:18 UTC that day. Both tags are annotated and point to their merge commits. Existing configuration and entity/device identifiers were retained; no migration was introduced.
+Beta 1 merged at 20:22:07 UTC and was published at 20:22:38 UTC on 2026-09-05. Beta 2 merged at 20:53:48 UTC and was published at 20:54:18 UTC that day. `v1.2.2` was published at 08:29:22 UTC on 2026-09-08 with `--latest`, so HACS now offers it to users who have not opted into betas. All three tags are annotated and point to their merge commits. Existing configuration and entity/device identifiers were retained; no migration was introduced.
 
 The validated local environment used Python 3.13, Home Assistant **2026.2.3**, pytest **9.0.0**, and pytest-homeassistant-custom-component **0.13.316**. The recorded test commands are in [AGENTS.md](../AGENTS.md). These are historical code-validation results; a documentation-only update does not imply they were rerun.
 
@@ -88,7 +90,7 @@ Discovery and identity details:
 
 The maintainer said HACS beta publication is the only practical way to test right now and that no other people are using the integration. Both release requests were carried through version bump, checked PR merge, annotated tag, and GitHub prerelease. Continue that workflow when a beta release is requested; do not request the same authorization again.
 
-No physical C-Gate/device testing was performed during the audit implementation. Suggested checks for the maintainer after installing `v1.2.2b2` through HACS and restarting Home Assistant:
+No physical C-Gate/device testing was performed during the audit implementation. Suggested checks for the maintainer after installing `v1.2.2` through HACS and restarting Home Assistant. These are now checks on a **stable** release rather than a beta, so regressions reach any non-beta user:
 
 - [ ] C-Gate unavailable during HA startup: entry retries and eventually loads.
 - [ ] C-Gate outage after setup: entities become unavailable, then recover automatically without reload.
@@ -98,7 +100,7 @@ No physical C-Gate/device testing was performed during the audit implementation.
 - [ ] Unread groups remain unknown, especially locks; virtual groups retain known values.
 - [ ] Entry unload/reload stops old connections/tasks and reconnects cleanly.
 
-Record the installed beta, HA and C-Gate versions, observed behavior, and relevant sanitized logs when results arrive. A successful automated suite is not a substitute for these installation checks. Handle regressions in the next beta if needed; stable promotion remains a separate release decision.
+Record the installed version, HA and C-Gate versions, observed behavior, and relevant sanitized logs when results arrive. A successful automated suite is not a substitute for these installation checks. Stable promotion has already happened at the maintainer's request, so handle any regression as a `1.2.3` fix — reverting is not the expected path unless they ask.
 
 ## Additional follow-ups outside items 1–9
 
