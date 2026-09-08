@@ -42,7 +42,7 @@ SCP_LIGHTING_PATTERN = re.compile(
 
 # Pattern to parse level response: "300 //PROJECT/NET/APP/GROUP: level=VALUE"
 LEVEL_RESPONSE_PATTERN = re.compile(
-    r"^300\s+\S+:\s+level=(\d+)"
+    r"^300\s+(\S+):\s+level=(\d+)"
 )
 
 # Pattern to parse SCP measurement events:
@@ -710,13 +710,13 @@ class CGateClient:
             return None
         match = LEVEL_RESPONSE_PATTERN.match(response)
         if match:
-            address = response.split()[1].removesuffix(":")
+            address = match.group(1)
             if address not in (group.address, f"//{self.project_name}/{group.address}"):
                 # The stream is out of sync. Do not consume its remaining reply
                 # as the result of the next command either.
                 self._mark_disconnected("GET level response address mismatch")
                 return None
-            return int(match.group(1))
+            return int(match.group(2))
         return None
 
     async def get_level(self, group: CGateGroup) -> int | None:
